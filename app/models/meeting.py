@@ -124,6 +124,11 @@ class Meeting(Base):
     analysis_status = Column(String, nullable=True)
     metadata_json = Column(Text, nullable=True)
 
+    # Phase 2.5: Meeting Intelligence → Task Assignment
+    document_file_path = Column(String, nullable=True)
+    document_filename = Column(String, nullable=True)
+    mom_questions = Column(Text, nullable=True)
+
     # Participant relationships
     participant_entries = relationship(
         "MeetingParticipant", back_populates="meeting", cascade="all, delete-orphan"

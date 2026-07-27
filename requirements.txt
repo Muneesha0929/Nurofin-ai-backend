@@ -17,3 +17,5 @@ google-auth-httplib2
 google-api-python-client
 aiosqlite>=0.19.0
 stream-chat>=4.5.1
+pypdf>=4.0.0
+python-docx>=1.0.0

@@ -105,6 +105,19 @@ class BulkApproveRequest(BaseModel):
     task_ids: List[int]
 
 
+class TaskConfirmItem(BaseModel):
+    extracted_task_id: int
+    title: Optional[str] = None
+    description: Optional[str] = None
+    priority: Optional[str] = None
+    deadline: Optional[str] = None
+    assigned_to_id: Optional[int] = None
+
+
+class TaskConfirmRequest(BaseModel):
+    tasks: List[TaskConfirmItem]
+
+
 class MeetingInDBBase(MeetingBase):
     id: Optional[int] = None
 
@@ -140,6 +153,9 @@ class Meeting(MeetingInDBBase):
     minutes_of_meeting: Optional[str] = None
     analysis_status: Optional[str] = None
     metadata_json: Optional[str] = None
+    document_file_path: Optional[str] = None
+    document_filename: Optional[str] = None
+    mom_questions: Optional[List] = None
 
     class Config:
         orm_mode = True
