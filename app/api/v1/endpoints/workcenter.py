@@ -1,8 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy import func, or_, case
+from sqlalchemy.orm import selectinload, aliased
+from sqlalchemy import func, or_, case, exists, select
 from typing import Any, Optional, List
 from datetime import datetime
 
@@ -10,6 +9,7 @@ from app.api import deps
 from app.models.user import User
 from app.models.task import Task, TaskStatusEnum, TaskPriorityEnum
 from app.models.quarter import Quarter
+from app.models.project import Project
 from app.models.task_history import TaskHistory
 from app.models.task_transfer import TaskTransfer, TransferStatusEnum
 from app.models.notification import Notification, NotificationTypeEnum
@@ -72,6 +72,52 @@ async def _add_history(db: AsyncSession, task_id: int, action: str, desc: str = 
                        old_value=old_val, new_value=new_val, performed_by_id=user_id))
 
 
+async def _recalculate_project_progress(db: AsyncSession, project_id: Optional[int]):
+    if not project_id:
+        return
+    q_all = select(Task).where(Task.project_id == project_id, Task.is_deleted == False)
+    all_tasks = (await db.execute(q_all)).scalars().all()
+    total = len(all_tasks)
+    completed = 0
+    for t in all_tasks:
+        status_val = t.status.value if hasattr(t.status, 'value') else (t.status or "todo")
+        if status_val in ("completed", "done"):
+            completed += 1
+            
+    progress = round((completed / total) * 100.0, 2) if total > 0 else 0.0
+    
+    q_proj = select(Project).where(Project.id == project_id)
+    proj = (await db.execute(q_proj)).scalars().first()
+    if proj:
+        proj.progress = progress
+        db.add(proj)
+        await db.commit()
+
+
+async def _recalculate_parent_progress(db: AsyncSession, parent_id: Optional[int]):
+    if not parent_id:
+        return
+    q_sub = select(Task).where(Task.parent_id == parent_id, Task.is_deleted == False)
+    subtasks = (await db.execute(q_sub)).scalars().all()
+    total = len(subtasks)
+    completed = 0
+    for t in subtasks:
+        status_val = t.status.value if hasattr(t.status, 'value') else (t.status or "todo")
+        if status_val in ("completed", "done"):
+            completed += 1
+            
+    progress = round((completed / total) * 100.0, 2) if total > 0 else 0.0
+    
+    q_parent = select(Task).where(Task.id == parent_id)
+    parent = (await db.execute(q_parent)).scalars().first()
+    if parent:
+        parent.progress = progress
+        db.add(parent)
+        await db.commit()
+        if parent.project_id:
+            await _recalculate_project_progress(db, parent.project_id)
+
+
 async def _get_user(db: AsyncSession, uid: int) -> Optional[User]:
     if not uid:
         return None
@@ -124,7 +170,22 @@ async def read_tasks(
 ) -> Any:
     q = select(Task).options(selectinload(Task.subtasks)).where(Task.is_deleted == False, Task.parent_id == None)
     if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        q = q.where(or_(Task.assigned_to_id == current_user.id, Task.assigned_by_id == current_user.id))
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (
+                (subtask_alias.assigned_to_id == current_user.id) |
+                (subtask_alias.assigned_by_id == current_user.id)
+            )
+        )
+        q = q.where(
+            or_(
+                Task.assigned_to_id == current_user.id,
+                Task.assigned_by_id == current_user.id,
+                subtask_exists
+            )
+        )
     if quarter_id:
         q = q.where(Task.quarter_id == quarter_id)
     if project_id:
@@ -134,11 +195,52 @@ async def read_tasks(
     if priority:
         q = q.where(Task.priority == priority)
     if assignee_id:
-        q = q.where(Task.assigned_to_id == assignee_id)
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (subtask_alias.assigned_to_id == assignee_id)
+        )
+        q = q.where(or_(Task.assigned_to_id == assignee_id, subtask_exists))
     if search:
         q = q.where(or_(Task.title.ilike(f"%{search}%"), Task.description.ilike(f"%{search}%")))
 
     count_q = select(func.count()).select_from(Task).where(Task.is_deleted == False, Task.parent_id == None)
+    if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (
+                (subtask_alias.assigned_to_id == current_user.id) |
+                (subtask_alias.assigned_by_id == current_user.id)
+            )
+        )
+        count_q = count_q.where(
+            or_(
+                Task.assigned_to_id == current_user.id,
+                Task.assigned_by_id == current_user.id,
+                subtask_exists
+            )
+        )
+    if quarter_id:
+        count_q = count_q.where(Task.quarter_id == quarter_id)
+    if project_id:
+        count_q = count_q.where(Task.project_id == project_id)
+    if status:
+        count_q = count_q.where(Task.status == status)
+    if priority:
+        count_q = count_q.where(Task.priority == priority)
+    if assignee_id:
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (subtask_alias.assigned_to_id == assignee_id)
+        )
+        count_q = count_q.where(or_(Task.assigned_to_id == assignee_id, subtask_exists))
+    if search:
+        count_q = count_q.where(or_(Task.title.ilike(f"%{search}%"), Task.description.ilike(f"%{search}%")))
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(q.order_by(Task.created_at.desc()).offset((page - 1) * page_size).limit(page_size))
     tasks = result.scalars().all()
@@ -155,7 +257,20 @@ async def get_summary(
 ) -> Any:
     base = [Task.is_deleted == False, Task.parent_id == None]
     if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        base.append(or_(Task.assigned_to_id == current_user.id, Task.assigned_by_id == current_user.id))
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (
+                (subtask_alias.assigned_to_id == current_user.id) |
+                (subtask_alias.assigned_by_id == current_user.id)
+            )
+        )
+        base.append(or_(
+            Task.assigned_to_id == current_user.id,
+            Task.assigned_by_id == current_user.id,
+            subtask_exists
+        ))
     if quarter_id:
         base.append(Task.quarter_id == quarter_id)
 
@@ -190,7 +305,20 @@ async def get_insights(
     if quarter_id:
         base.append(Task.quarter_id == quarter_id)
     if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        base.append(or_(Task.assigned_to_id == current_user.id, Task.assigned_by_id == current_user.id))
+        subtask_alias = aliased(Task)
+        subtask_exists = exists().where(
+            (subtask_alias.parent_id == Task.id) &
+            (subtask_alias.is_deleted == False) &
+            (
+                (subtask_alias.assigned_to_id == current_user.id) |
+                (subtask_alias.assigned_by_id == current_user.id)
+            )
+        )
+        base.append(or_(
+            Task.assigned_to_id == current_user.id,
+            Task.assigned_by_id == current_user.id,
+            subtask_exists
+        ))
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
     deadline_q = select(Task).where(*base, Task.deadline != None, Task.deadline >= today, Task.status != TaskStatusEnum.completed).order_by(Task.deadline.asc()).limit(10)
@@ -227,7 +355,7 @@ async def get_insights(
         Task.assigned_to_id,
         func.count(Task.id).label("total"),
         func.count(case((Task.status == TaskStatusEnum.completed, 1))).label("completed"),
-    ).where(Task.is_deleted == False, Task.assigned_to_id != None, Task.parent_id == None)
+    ).where(Task.is_deleted == False, Task.assigned_to_id != None)
     if quarter_id:
         perf_q = perf_q.where(Task.quarter_id == quarter_id)
     perf_q = perf_q.group_by(Task.assigned_to_id)
@@ -273,6 +401,9 @@ async def create_task(
         await _update_parent_task(db, parent_id, current_user.id)
         await _add_history(db, parent_id, "subtask_added", f"Subtask '{title}' added to Main Task", user_id=current_user.id)
     await db.commit()
+    await _recalculate_project_progress(db, task.project_id)
+    if task.parent_id:
+        await _recalculate_parent_progress(db, task.parent_id)
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task.id))
     task = r.scalars().first()
     return success_response(data=await _serialize_task(db, task))
@@ -320,6 +451,9 @@ async def update_task(
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
     await db.commit()
+    await _recalculate_project_progress(db, task.project_id)
+    if task.parent_id:
+        await _recalculate_parent_progress(db, task.parent_id)
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))
     task = r.scalars().first()
     return success_response(data=await _serialize_task(db, task))
@@ -333,11 +467,16 @@ async def delete_task(
     task = r.scalars().first()
     if not task:
         return error_response(message="Task not found")
+    parent_id_saved = task.parent_id
+    project_id_saved = task.project_id
     task.is_deleted = True
     await _add_history(db, task_id, "deleted", "Task deleted", user_id=current_user.id)
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
     await db.commit()
+    await _recalculate_project_progress(db, project_id_saved)
+    if parent_id_saved:
+        await _recalculate_parent_progress(db, parent_id_saved)
     return success_response(message="Task deleted")
 
 
@@ -367,6 +506,9 @@ async def update_status(
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
     await db.commit()
+    await _recalculate_project_progress(db, task.project_id)
+    if task.parent_id:
+        await _recalculate_parent_progress(db, task.parent_id)
     return success_response(data={"status": status})
 
 
@@ -377,15 +519,22 @@ async def bulk_status(
 ) -> Any:
     r = await db.execute(select(Task).filter(Task.id.in_(task_ids), Task.is_deleted == False))
     parent_ids = set()
+    project_ids = set()
     for task in r.scalars().all():
         old = task.status.value if task.status else None
         task.status = status
         await _add_history(db, task.id, "status_changed", f"Status: {old} → {status}", old_val=old, new_val=status, user_id=current_user.id)
         if task.parent_id:
             parent_ids.add(task.parent_id)
+        if task.project_id:
+            project_ids.add(task.project_id)
     for p_id in parent_ids:
         await _update_parent_task(db, p_id, current_user.id)
     await db.commit()
+    for p_id in project_ids:
+        await _recalculate_project_progress(db, p_id)
+    for p_id in parent_ids:
+        await _recalculate_parent_progress(db, p_id)
     return success_response(message=f"Updated {len(task_ids)} tasks")
 
 
@@ -508,7 +657,7 @@ async def get_performance(
     user = await _get_user(db, user_id)
     if not user:
         return error_response(message="User not found")
-    base = [Task.assigned_to_id == user_id, Task.is_deleted == False, Task.parent_id == None]
+    base = [Task.assigned_to_id == user_id, Task.is_deleted == False]
     if quarter_id:
         base.append(Task.quarter_id == quarter_id)
 

@@ -178,6 +178,10 @@ async def delete_project(
     if not project:
         return error_response(message="Project not found")
 
+    role = current_user.role.value if hasattr(current_user.role, 'value') else current_user.role
+    if role not in ("ceo", "admin", "super_admin"):
+        return error_response(message="Only CEO can delete projects")
+
     project.is_deleted = True
     await db.commit()
     return success_response(message="Project deleted")
