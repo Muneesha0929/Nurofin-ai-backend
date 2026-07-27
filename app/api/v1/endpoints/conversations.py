@@ -16,6 +16,7 @@ from app.schemas.conversation import (
     ConversationMessageRead,
 )
 from app.core.responses import APIResponse, success_response, error_response
+from app.services.knowledge_indexer import KnowledgeIndexer
 
 router = APIRouter()
 
@@ -65,6 +66,14 @@ async def create_conversation(
     db.add(db_conv)
     await db.commit()
     await db.refresh(db_conv)
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_conversation(db_conv.id)
+        await db.commit()
+    except Exception:
+        pass
+
     return success_response(
         data={
             "id": db_conv.id,
@@ -217,6 +226,13 @@ async def add_message(
     await db.commit()
     await db.refresh(db_msg)
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_conversation(conv.id)
+        await db.commit()
+    except Exception:
+        pass
+
     return success_response(
         data={
             "id": db_msg.id,
@@ -265,6 +281,13 @@ async def add_messages_bulk(
     conv.updated_at = datetime.utcnow()
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_conversation(conv.id)
+        await db.commit()
+    except Exception:
+        pass
 
     return success_response(
         data=[

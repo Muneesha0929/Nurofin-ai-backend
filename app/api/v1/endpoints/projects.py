@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.task import Task
 from app.schemas.project import ProjectCreate, ProjectUpdate
 from app.core.responses import APIResponse, success_response, error_response
+from app.services.knowledge_indexer import KnowledgeIndexer
 
 router = APIRouter()
 
@@ -118,6 +119,13 @@ async def create_project(
     
     await db.commit()
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_project(db_project.id)
+        await db.commit()
+    except Exception:
+        pass
+
     # Reload with relationships for serialization
     result = await db.execute(
         select(Project)
@@ -152,6 +160,13 @@ async def update_project(
     for field, value in update_data.items():
         setattr(project, field, value)
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_project(project.id)
+        await db.commit()
+    except Exception:
+        pass
 
     result = await db.execute(
         select(Project)

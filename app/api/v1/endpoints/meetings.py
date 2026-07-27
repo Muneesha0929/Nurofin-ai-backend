@@ -25,6 +25,7 @@ from app.schemas.meeting import (
 )
 from app.core.responses import APIResponse, success_response, error_response
 from app.services.google_calendar import fetch_calendar_events
+from app.services.knowledge_indexer import KnowledgeIndexer
 from datetime import timezone
 
 router = APIRouter()
@@ -463,6 +464,13 @@ async def create_meeting(
 
     await db.commit()
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(db_meeting.id)
+        await db.commit()
+    except Exception:
+        pass
+
     res = await db.execute(
         select(Meeting)
         .options(
@@ -516,6 +524,13 @@ async def update_meeting(
             )
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
 
     res = await db.execute(
         select(Meeting)
@@ -737,6 +752,13 @@ async def upload_mom(
 
     await db.commit()
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
+
     res = await db.execute(
         select(Meeting)
         .options(
@@ -885,6 +907,13 @@ async def analyze_mom(
             )
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
 
     res = await db.execute(
         select(Meeting)
@@ -1035,6 +1064,13 @@ async def analyze_meeting(
 
     await db.commit()
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
+
     res = await db.execute(
         select(Meeting)
         .options(
@@ -1151,6 +1187,13 @@ async def upload_transcript(
     await _add_timeline(db, id, "transcript_uploaded", f"Transcript uploaded by {current_user.full_name}", current_user.id)
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
 
     res = await db.execute(
         select(Meeting)
@@ -1721,6 +1764,13 @@ async def analyze_meeting_enhanced(
 
     await db.commit()
 
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
+
     res = await db.execute(
         select(Meeting)
         .options(
@@ -1838,6 +1888,14 @@ async def confirm_and_create_tasks(
         )
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_meeting(id)
+        await db.commit()
+    except Exception:
+        pass
+
     return success_response(data={"count": len(created), "tasks": created}, message=f"{len(created)} task(s) created and assigned")
 
 

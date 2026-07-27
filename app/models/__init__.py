@@ -9,6 +9,7 @@ from .meeting import (
 )
 from .issue import Issue, IssueStatusEnum, IssuePriorityEnum
 from .knowledge import Knowledge
+from .knowledge_chunk import KnowledgeChunk
 from .notification import Notification, NotificationTypeEnum
 from .deleted_user import DeletedUser
 from .conversation import Conversation, ConversationMessage

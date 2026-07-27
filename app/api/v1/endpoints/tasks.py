@@ -10,6 +10,7 @@ from app.models.user import User
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.task import TaskCreate, TaskUpdate, Task as TaskSchema
 from app.core.responses import APIResponse, success_response, error_response
+from app.services.knowledge_indexer import KnowledgeIndexer
 
 router = APIRouter()
 
@@ -115,6 +116,14 @@ async def create_task(
             await _create_task_assignment_notification(db, db_task, current_user)
 
         await db.commit()
+
+        try:
+            indexer = KnowledgeIndexer(db)
+            await indexer.index_task(db_task.id)
+            await db.commit()
+        except Exception:
+            pass
+
         await db.refresh(db_task)
         
         # Recalculate project progress
@@ -158,6 +167,13 @@ async def update_task(
         await _create_task_assignment_notification(db, task, current_user)
 
     await db.commit()
+
+    try:
+        indexer = KnowledgeIndexer(db)
+        await indexer.index_task(task.id)
+        await db.commit()
+    except Exception:
+        pass
     
     # Recalculate progress for new and old projects
     if task.project_id:
