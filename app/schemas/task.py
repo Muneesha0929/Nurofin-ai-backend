@@ -17,6 +17,9 @@ class TaskBase(BaseModel):
     project_id: Optional[int] = None
     meeting_id: Optional[int] = None
     mom_id: Optional[int] = None
+    scheduled_date: Optional[Union[datetime, str]] = None
+    scheduled_start_time: Optional[str] = None
+    scheduled_end_time: Optional[str] = None
 
 class TaskCreate(TaskBase):
     title: str

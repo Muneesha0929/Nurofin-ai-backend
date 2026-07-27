@@ -432,3 +432,60 @@ async def delete_role(
     db.add(role)
     await db.commit()
     return success_response(message="Role soft-deleted successfully")
+
+
+from app.models.meeting import Meeting, MeetingParticipant, ParticipantStatusEnum
+from app.models.task import Task
+from sqlalchemy import or_, and_
+
+@router.get("/{user_id}/availability", response_model=APIResponse)
+async def check_availability(
+    user_id: int,
+    date: str,
+    start_time: str,
+    end_time: str,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    # 1. Check Meetings
+    meetings_res = await db.execute(
+        select(Meeting).join(MeetingParticipant).filter(
+            MeetingParticipant.user_id == user_id,
+            MeetingParticipant.status != ParticipantStatusEnum.declined,
+            Meeting.date == date,
+            Meeting.is_deleted == False,
+            or_(
+                and_(Meeting.start_time <= start_time, Meeting.end_time > start_time),
+                and_(Meeting.start_time < end_time, Meeting.end_time >= end_time),
+                and_(Meeting.start_time >= start_time, Meeting.end_time <= end_time)
+            )
+        )
+    )
+    conflicting_meetings = meetings_res.scalars().all()
+    
+    # 2. Check Tasks Time Blocks
+    tasks_res = await db.execute(
+        select(Task).filter(
+            Task.assigned_to_id == user_id,
+            Task.scheduled_date == date,
+            or_(
+                and_(Task.scheduled_start_time <= start_time, Task.scheduled_end_time > start_time),
+                and_(Task.scheduled_start_time < end_time, Task.scheduled_end_time >= end_time),
+                and_(Task.scheduled_start_time >= start_time, Task.scheduled_end_time <= end_time)
+            )
+        )
+    )
+    conflicting_tasks = tasks_res.scalars().all()
+    
+    is_busy = len(conflicting_meetings) > 0 or len(conflicting_tasks) > 0
+    
+    reasons = []
+    if conflicting_meetings:
+        reasons.append("busy with meetings")
+    if conflicting_tasks:
+        reasons.append("busy working on a task")
+        
+    return success_response(
+        data={"is_busy": is_busy, "reasons": reasons},
+        message="Availability checked successfully"
+    )
