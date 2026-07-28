@@ -164,16 +164,18 @@ async def get_user_schedule(
     tasks = tasks_result.scalars().all()
 
     for t in tasks:
+        task_date = t.scheduled_date or t.deadline
         schedule.append({
+            "id": t.id,
             "source": "nurofin_task",
             "title": t.title,
             "description": t.description or "",
-            "date": t.deadline,
-            "start_time": "09:00",  # Defaulting task to 9 AM display
-            "end_time": "10:00",
+            "date": task_date,
+            "start_time": t.scheduled_start_time or "09:00",
+            "end_time": t.scheduled_end_time or "10:00",
             "type": "task",
             "status": t.status.value if t.status else "todo",
-            "read_only": True
+            "read_only": False
         })
 
     if target_user.google_access_token and target_user.google_refresh_token:
@@ -195,7 +197,15 @@ async def get_user_schedule(
         except Exception as e:
             print(f"Failed to fetch Google Calendar for user {target_user_id}: {e}")
 
-    schedule.sort(key=lambda x: x.get("start") or x.get("date", ""), reverse=False)
+    def get_sort_key(x):
+        dt = x.get("start") or x.get("date")
+        if isinstance(dt, datetime):
+            return dt.isoformat()
+        if hasattr(dt, 'isoformat'): # date object
+            return dt.isoformat()
+        return str(dt) if dt else ""
+        
+    schedule.sort(key=get_sort_key, reverse=False)
 
     return success_response(
         data={
