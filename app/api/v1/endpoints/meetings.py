@@ -1618,8 +1618,11 @@ Return ONLY a valid JSON object with exactly these fields (no markdown, no code 
 }
 
 Important rules:
-- Extract ALL action items, even implicit ones
-- For suggested_owner, use the actual person's name if mentioned in context of the task
+- ONLY extract action items that are EXPLICITLY assigned tasks or direct commitments
+- IGNORE discussion points, general observations, opinions, or ideas that were not assigned to anyone
+- A true action item must have an explicit owner or clear delegation (e.g. "John will handle this", "Sarah to send the report")
+- If something was discussed but no one was assigned, it is NOT an action item
+- For suggested_owner, ONLY use the person's name if explicitly mentioned as the assignee
 - For priority: high = urgent/critical/blocking, medium = important but not urgent, low = nice to have
 - If a section has no items, use an empty array []
 - If a field cannot be determined, use null
