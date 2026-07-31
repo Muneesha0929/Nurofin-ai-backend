@@ -255,9 +255,9 @@ async def read_meetings(
 
     # Sort combined data
     if sort == "date" or not sort:
-        data.sort(key=lambda x: x.get("date", ""), reverse=True)
+        data.sort(key=lambda x: (x.get("date") or ""), reverse=True)
     elif sort == "title":
-        data.sort(key=lambda x: x.get("title", ""))
+        data.sort(key=lambda x: (x.get("title") or ""))
 
     return success_response(data=data, message="Events fetched successfully")
 
