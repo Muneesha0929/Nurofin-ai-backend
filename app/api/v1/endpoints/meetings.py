@@ -175,6 +175,7 @@ async def read_meetings(
     filter: Optional[str] = Query(None, description="Filter by: today, weekly, monthly"),
     search: Optional[str] = Query(None, description="Search by title"),
     sort: Optional[str] = Query(None, description="Sort by: date, title, status"),
+    target_user_id: Optional[int] = Query(None, description="Target user ID to fetch for"),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     stmt = (
@@ -186,7 +187,7 @@ async def read_meetings(
         .filter(Meeting.is_deleted == False)
     )
     
-    if current_user.role not in ["super_admin", "ceo"]:
+    if (current_user.role or "").lower() not in ["super_admin", "admin", "ceo"]:
         stmt = stmt.outerjoin(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
         stmt = stmt.filter(
             (Meeting.owner_id == current_user.id) | 
@@ -226,7 +227,20 @@ async def read_meetings(
     data = [_serialize_meeting(m) for m in meetings]
 
     # Fetch Google Calendar Events if connected
-    if current_user.google_access_token and current_user.google_refresh_token:
+    user_to_fetch = current_user
+    if target_user_id:
+        if (current_user.role or "").lower() in ["super_admin", "admin", "ceo"]:
+            target_res = await db.execute(select(User).filter(User.id == target_user_id))
+            target_u = target_res.scalars().first()
+            if target_u:
+                user_to_fetch = target_u
+        elif target_user_id == current_user.id:
+            user_to_fetch = current_user
+        else:
+            # Unauthorized to fetch other's google calendar
+            user_to_fetch = None
+
+    if user_to_fetch and user_to_fetch.google_access_token and user_to_fetch.google_refresh_token:
         time_min = datetime.now(timezone.utc)
         time_max = time_min + timedelta(days=7)
         if filter == "today":
@@ -235,10 +249,24 @@ async def read_meetings(
             time_max = time_min + timedelta(days=30)
             
         try:
-            google_events = fetch_calendar_events(current_user, time_min, time_max)
+            google_events = fetch_calendar_events(user_to_fetch, time_min, time_max)
+            
+            existing_event_keys = set()
+            for d in data:
+                title = d.get("title", "").strip().lower()
+                date_str = d.get("date", "")
+                existing_event_keys.add((title, date_str))
+
             for item in google_events:
                 start = item['start'].get('dateTime', item['start'].get('date'))
                 end = item['end'].get('dateTime', item['end'].get('date'))
+                
+                g_title = item.get('summary', 'Busy').strip().lower()
+                g_date_str = start[:10] if start else ""
+                
+                if (g_title, g_date_str) in existing_event_keys:
+                    continue
+
                 data.append({
                     "id": item.get("id"),
                     "title": item.get('summary', 'Busy'),
@@ -248,7 +276,8 @@ async def read_meetings(
                     "end_time": end[11:16] if end and len(end) > 10 else "00:00",
                     "type": "google_event",
                     "status": "scheduled",
-                    "source": "google_calendar"
+                    "source": "google_calendar",
+                    "owner_id": str(user_to_fetch.id)
                 })
         except Exception as e:
             print(f"Failed to fetch Google Calendar: {e}")

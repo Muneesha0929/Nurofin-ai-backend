@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = "YOUR_GOOGLE_CLIENT_SECRET"
     GOOGLE_PROJECT_ID: str = "YOUR_PROJECT_ID"
     
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = "us-east-1"
+    AWS_BUCKET_NAME: str = ""
+    
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
         import os

@@ -146,7 +146,9 @@ async def get_user_schedule(
             "end_time": m.end_time,
             "type": m.type.value if m.type else "meeting",
             "status": m.status.value if m.status else "scheduled",
-            "read_only": True
+            "read_only": True,
+            "hangout_link": m.meeting_link or None,
+            "location": m.location or None,
         })
 
     # Fetch Tasks for the target user
@@ -181,9 +183,25 @@ async def get_user_schedule(
     if target_user.google_access_token and target_user.google_refresh_token:
         try:
             google_events = fetch_calendar_events(target_user, time_min, time_max)
+            
+            existing_event_keys = set()
+            for s in schedule:
+                if s.get("source") == "nurofin":
+                    d = s.get("date")
+                    d_str = d.isoformat() if hasattr(d, "isoformat") else str(d)
+                    title = s.get("title", "").strip().lower()
+                    existing_event_keys.add((title, d_str[:10]))
+
             for item in google_events:
                 start = item['start'].get('dateTime', item['start'].get('date'))
                 end = item['end'].get('dateTime', item['end'].get('date'))
+                
+                g_title = item.get('summary', 'Busy').strip().lower()
+                g_date_str = start[:10] if start else ""
+                
+                if (g_title, g_date_str) in existing_event_keys:
+                    continue
+
                 schedule.append({
                     "source": "google_calendar",
                     "title": item.get('summary', 'Busy'),
@@ -192,10 +210,26 @@ async def get_user_schedule(
                     "end": end,
                     "type": "google_event",
                     "status": "scheduled",
-                    "read_only": True
+                    "read_only": True,
+                    "hangout_link": item.get('hangoutLink'),
+                    "event_link": item.get('htmlLink'),
+                    "location": item.get('location'),
                 })
         except Exception as e:
             print(f"Failed to fetch Google Calendar for user {target_user_id}: {e}")
+            schedule.append({
+                "source": "google_error",
+                "title": "Google Calendar sync failed",
+                "description": f"Could not load Google events: {e}",
+                "start": None,
+                "end": None,
+                "type": "google_error",
+                "status": "error",
+                "read_only": True,
+                "error": str(e),
+            })
+        finally:
+            await db.commit()
 
     def get_sort_key(x):
         dt = x.get("start") or x.get("date")

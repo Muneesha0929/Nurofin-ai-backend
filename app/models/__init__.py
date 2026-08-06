@@ -16,10 +16,12 @@ from .conversation import Conversation, ConversationMessage
 from .quarter import Quarter, QuarterStatusEnum
 from .task_history import TaskHistory
 from .task_transfer import TaskTransfer, TransferStatusEnum
-from .task_checklist import TaskChecklist
-from .task_comment import TaskComment
-from .task_dependency import TaskDependency
+from app.models.task_checklist import TaskChecklist
+from app.models.task_comment import TaskComment
+from app.models.task_dependency import TaskDependency
+from app.models.task_history import TaskHistory
+from app.models.task_transfer import TaskTransfer
+from app.models.document import Document, DocumentUserAccess
 from .label import Label, task_labels
 from .performance_score import PerformanceScore
 from .audit_log import AuditLog
-
