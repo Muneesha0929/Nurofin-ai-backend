@@ -21,10 +21,16 @@ async def login_access_token(
     """
     OAuth2 compatible token login, get an access token for future requests.
     """
+    print(f"DEBUG: Login attempt - Username: '{form_data.username}' | Password: '{form_data.password}'")
     result = await db.execute(select(User).filter(User.email == form_data.username))
     user = result.scalars().first()
     
+    if user:
+        print(f"DEBUG: Hashed password in DB: {user.hashed_password}")
+        print(f"DEBUG: verify_password result: {security.verify_password(form_data.password, user.hashed_password)}")
+
     if not user or not security.verify_password(form_data.password, user.hashed_password):
+        print(f"DEBUG: Login failed. User exists: {bool(user)}")
         raise HTTPException(status_code=400, detail="Incorrect email or password")
     elif not user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")

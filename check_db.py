@@ -1,27 +1,32 @@
-import asyncio
-from sqlalchemy import select
+﻿import asyncio
+import sys
+
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from app.db.session import SessionLocal
-
-# Import all models
+from sqlalchemy import select, text
 from app.models.user import User
-from app.models.task import Task
-from app.models.project import Project
-from app.models.meeting import Meeting, MeetingParticipant, MeetingExtractedTask, MeetingTimeline
-from app.models.notification import Notification
-# try to import any other models if they exist, but these are the main ones
 
-async def main():
-    async with SessionLocal() as db:
-        models = [User, Task, Project, Meeting, MeetingParticipant, MeetingExtractedTask, MeetingTimeline, Notification]
-        for model in models:
-            try:
-                await db.execute(select(model).limit(1))
-                print(f"{model.__name__}: OK")
-            except Exception as e:
-                print(f"{model.__name__}: ERROR - {str(e)}")
+async def check_db():
+    async with SessionLocal() as session:
+        # Check database connection info
+        result = await session.execute(text("SELECT inet_server_addr(), current_database();"))
+        db_info = result.fetchone()
+        
+        # Check user
+        result = await session.execute(select(User).where(User.email == "muneesha09@gmail.com"))
+        user = result.scalar_one_or_none()
+        
+        print(f"Database server address: {db_info[0]}")
+        print(f"Database name: {db_info[1]}")
+        
+        if user:
+            print(f"User ID: {user.id}")
+            print(f"User email: {user.email}")
+            print(f"Password Hash (first 10 chars): {user.hashed_password[:10]}...")
+        else:
+            print("User not found in this database.")
 
-if __name__ == "__main__":
-    import sys
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(check_db())

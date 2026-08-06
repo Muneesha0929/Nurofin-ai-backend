@@ -65,12 +65,20 @@ def exchange_code_for_tokens(code: str, redirect_uri: str):
 
 
 def refresh_credentials(user) -> Credentials:
+    token_expiry = None
+    if user.google_token_expires_at:
+        try:
+            token_expiry = datetime.fromisoformat(user.google_token_expires_at)
+        except ValueError:
+            token_expiry = None
+
     creds = Credentials(
         token=user.google_access_token,
         refresh_token=user.google_refresh_token,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET
+        client_secret=GOOGLE_CLIENT_SECRET,
+        expiry=token_expiry
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
