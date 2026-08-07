@@ -169,23 +169,7 @@ async def read_tasks(
     page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
 ) -> Any:
     q = select(Task).options(selectinload(Task.subtasks)).where(Task.is_deleted == False, Task.parent_id == None)
-    if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        subtask_alias = aliased(Task)
-        subtask_exists = exists().where(
-            (subtask_alias.parent_id == Task.id) &
-            (subtask_alias.is_deleted == False) &
-            (
-                (subtask_alias.assigned_to_id == current_user.id) |
-                (subtask_alias.assigned_by_id == current_user.id)
-            )
-        )
-        q = q.where(
-            or_(
-                Task.assigned_to_id == current_user.id,
-                Task.assigned_by_id == current_user.id,
-                subtask_exists
-            )
-        )
+
     if quarter_id:
         q = q.where(Task.quarter_id == quarter_id)
     if project_id:
@@ -206,23 +190,7 @@ async def read_tasks(
         q = q.where(or_(Task.title.ilike(f"%{search}%"), Task.description.ilike(f"%{search}%")))
 
     count_q = select(func.count()).select_from(Task).where(Task.is_deleted == False, Task.parent_id == None)
-    if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        subtask_alias = aliased(Task)
-        subtask_exists = exists().where(
-            (subtask_alias.parent_id == Task.id) &
-            (subtask_alias.is_deleted == False) &
-            (
-                (subtask_alias.assigned_to_id == current_user.id) |
-                (subtask_alias.assigned_by_id == current_user.id)
-            )
-        )
-        count_q = count_q.where(
-            or_(
-                Task.assigned_to_id == current_user.id,
-                Task.assigned_by_id == current_user.id,
-                subtask_exists
-            )
-        )
+
     if quarter_id:
         count_q = count_q.where(Task.quarter_id == quarter_id)
     if project_id:
@@ -256,21 +224,7 @@ async def get_summary(
     quarter_id: Optional[int] = None,
 ) -> Any:
     base = [Task.is_deleted == False, Task.parent_id == None]
-    if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        subtask_alias = aliased(Task)
-        subtask_exists = exists().where(
-            (subtask_alias.parent_id == Task.id) &
-            (subtask_alias.is_deleted == False) &
-            (
-                (subtask_alias.assigned_to_id == current_user.id) |
-                (subtask_alias.assigned_by_id == current_user.id)
-            )
-        )
-        base.append(or_(
-            Task.assigned_to_id == current_user.id,
-            Task.assigned_by_id == current_user.id,
-            subtask_exists
-        ))
+
     if quarter_id:
         base.append(Task.quarter_id == quarter_id)
 
@@ -304,21 +258,7 @@ async def get_insights(
     base = [Task.is_deleted == False, Task.parent_id == None]
     if quarter_id:
         base.append(Task.quarter_id == quarter_id)
-    if current_user.role not in ("ceo", "admin", "super_admin", "manager"):
-        subtask_alias = aliased(Task)
-        subtask_exists = exists().where(
-            (subtask_alias.parent_id == Task.id) &
-            (subtask_alias.is_deleted == False) &
-            (
-                (subtask_alias.assigned_to_id == current_user.id) |
-                (subtask_alias.assigned_by_id == current_user.id)
-            )
-        )
-        base.append(or_(
-            Task.assigned_to_id == current_user.id,
-            Task.assigned_by_id == current_user.id,
-            subtask_exists
-        ))
+
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
     deadline_q = select(Task).where(*base, Task.deadline != None, Task.deadline >= today, Task.status != TaskStatusEnum.completed).order_by(Task.deadline.asc()).limit(10)
@@ -669,7 +609,7 @@ async def get_performance(
     t_in = (await db.execute(select(func.count()).select_from(TaskTransfer).where(TaskTransfer.to_user_id == user_id, TaskTransfer.is_deleted == False))).scalar() or 0
     pct = round((completed / total) * 100, 1) if total > 0 else 0.0
 
-    tasks_r = await db.execute(select(Task).where(*base).order_by(Task.created_at.desc()).limit(50))
+    tasks_r = await db.execute(select(Task).options(selectinload(Task.subtasks)).where(*base).order_by(Task.created_at.desc()).limit(50))
     tasks = [await _serialize_task(db, t) for t in tasks_r.scalars().all()]
 
     return success_response(data={
