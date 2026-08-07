@@ -41,12 +41,7 @@ async def read_tasks(
         .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by))
         .filter(Task.is_deleted == False)
     )
-    if (current_user.role or "").lower() not in ["super_admin", "admin", "ceo"]:
-        stmt = stmt.filter(
-            (Task.assigned_to_id == current_user.id) | 
-            (Task.assigned_by_id == current_user.id)
-        )
-        
+
     result = await db.execute(stmt.offset(skip).limit(limit))
     tasks = result.scalars().all()
     data = [TaskSchema.from_orm(t).dict() for t in tasks]
@@ -68,12 +63,7 @@ async def read_overdue_tasks(
         .filter(Task.status != TaskStatusEnum.completed)
         .filter(Task.deadline < today_str)
     )
-    if (current_user.role or "").lower() not in ["super_admin", "admin", "ceo"]:
-        stmt = stmt.filter(
-            (Task.assigned_to_id == current_user.id) | 
-            (Task.assigned_by_id == current_user.id)
-        )
-        
+
     result = await db.execute(stmt.offset(skip).limit(limit))
     tasks = result.scalars().all()
     data = [TaskSchema.from_orm(t).dict() for t in tasks]
