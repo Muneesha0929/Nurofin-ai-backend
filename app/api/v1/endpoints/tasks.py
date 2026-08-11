@@ -98,7 +98,30 @@ async def create_task(
 ) -> Any:
     try:
         task_data = task_in.dict(exclude_unset=True)
-        db_task = Task(**task_data, assigned_by_id=current_user.id)
+        
+        # Determine quarter_id from deadline or scheduled_date
+        date_str = task_data.get("deadline") or task_data.get("scheduled_date")
+        if date_str:
+            if hasattr(date_str, "strftime"):
+                date_str = date_str.strftime("%Y-%m-%d")
+            else:
+                date_str = str(date_str)
+        
+        quarter_id = None
+        if date_str:
+            if 'T' in date_str:
+                date_str = date_str.split('T')[0]
+            from app.models.quarter import Quarter
+            q_res = await db.execute(select(Quarter).filter(
+                Quarter.is_deleted == False,
+                Quarter.start_date <= date_str,
+                Quarter.end_date >= date_str
+            ))
+            quarter = q_res.scalars().first()
+            if quarter:
+                quarter_id = quarter.id
+                
+        db_task = Task(**task_data, assigned_by_id=current_user.id, quarter_id=quarter_id)
         db.add(db_task)
         await db.flush()
 
@@ -152,6 +175,26 @@ async def update_task(
     update_data = task_in.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(task, field, value)
+        
+    # Determine quarter_id from updated deadline or scheduled_date
+    date_str = update_data.get("deadline") or update_data.get("scheduled_date")
+    if date_str:
+        if hasattr(date_str, "strftime"):
+            date_str = date_str.strftime("%Y-%m-%d")
+        else:
+            date_str = str(date_str)
+            
+        if 'T' in date_str:
+            date_str = date_str.split('T')[0]
+        from app.models.quarter import Quarter
+        q_res = await db.execute(select(Quarter).filter(
+            Quarter.is_deleted == False,
+            Quarter.start_date <= date_str,
+            Quarter.end_date >= date_str
+        ))
+        quarter = q_res.scalars().first()
+        if quarter:
+            task.quarter_id = quarter.id
         
     if task.assigned_to_id and task.assigned_to_id != old_assigned_to_id:
         await _create_task_assignment_notification(db, task, current_user)
