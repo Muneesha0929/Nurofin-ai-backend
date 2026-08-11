@@ -18,17 +18,11 @@ from app.core.responses import success_response, error_response
 router = APIRouter()
 
 
-async def _serialize_task(db: AsyncSession, t: Task) -> dict:
+async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True) -> dict:
     subtasks = []
-    if hasattr(t, "subtasks") and t.subtasks:
+    if load_subtasks and hasattr(t, "subtasks") and t.subtasks:
         for s in t.subtasks:
-            s_user = (await db.execute(select(User).filter(User.id == s.assigned_to_id))).scalars().first() if s.assigned_to_id else None
-            subtasks.append({
-                "id": s.id, "title": s.title,
-                "status": s.status.value if hasattr(s.status, 'value') else (s.status or "todo"),
-                "assigned_to_id": s.assigned_to_id,
-                "assigned_to_name": s_user.full_name if s_user else None,
-            })
+            subtasks.append(await _serialize_task(db, s, load_subtasks=False))
     assignee = (await db.execute(select(User).filter(User.id == t.assigned_to_id))).scalars().first() if t.assigned_to_id else None
     assigner = (await db.execute(select(User).filter(User.id == t.assigned_by_id))).scalars().first() if t.assigned_by_id else None
     reviewer = (await db.execute(select(User).filter(User.id == t.reviewer_id))).scalars().first() if t.reviewer_id else None
@@ -171,7 +165,7 @@ async def read_tasks(
     q = select(Task).options(selectinload(Task.subtasks)).where(Task.is_deleted == False, Task.parent_id == None)
 
     if quarter_id:
-        q = q.where(Task.quarter_id == quarter_id)
+        q = q.where(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
     if project_id:
         q = q.where(Task.project_id == project_id)
     if status:
@@ -192,7 +186,7 @@ async def read_tasks(
     count_q = select(func.count()).select_from(Task).where(Task.is_deleted == False, Task.parent_id == None)
 
     if quarter_id:
-        count_q = count_q.where(Task.quarter_id == quarter_id)
+        count_q = count_q.where(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
     if project_id:
         count_q = count_q.where(Task.project_id == project_id)
     if status:
@@ -226,7 +220,7 @@ async def get_summary(
     base = [Task.is_deleted == False, Task.parent_id == None]
 
     if quarter_id:
-        base.append(Task.quarter_id == quarter_id)
+        base.append(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
 
     async def _count(extra=None):
         cond = base + (extra or [])
@@ -257,7 +251,7 @@ async def get_insights(
 ) -> Any:
     base = [Task.is_deleted == False, Task.parent_id == None]
     if quarter_id:
-        base.append(Task.quarter_id == quarter_id)
+        base.append(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
 
 
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -297,7 +291,7 @@ async def get_insights(
         func.count(case((Task.status == TaskStatusEnum.completed, 1))).label("completed"),
     ).where(Task.is_deleted == False, Task.assigned_to_id != None)
     if quarter_id:
-        perf_q = perf_q.where(Task.quarter_id == quarter_id)
+        perf_q = perf_q.where(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
     perf_q = perf_q.group_by(Task.assigned_to_id)
     perf_result = await db.execute(perf_q)
     performers = []
@@ -316,6 +310,21 @@ async def get_insights(
     })
 
 
+async def _determine_quarter_id(db: AsyncSession, date_str: str) -> Optional[int]:
+    if not date_str:
+        return None
+    if 'T' in date_str:
+        date_str = date_str.split('T')[0]
+    q = select(Quarter).filter(
+        Quarter.is_deleted == False,
+        Quarter.start_date <= date_str,
+        Quarter.end_date >= date_str
+    )
+    result = await db.execute(q)
+    quarter = result.scalars().first()
+    return quarter.id if quarter else None
+
+
 # ─── CREATE / UPDATE / DELETE ─────────────────────────────────────────────────
 
 @router.post("")
@@ -326,6 +335,8 @@ async def create_task(
     reviewer_id: int = None, parent_id: int = None, deadline: str = None,
     start_date: str = None, estimated_hours: float = None,
 ) -> Any:
+    if not quarter_id:
+        quarter_id = await _determine_quarter_id(db, deadline or start_date)
     task = Task(title=title, description=description, priority=priority,
                 project_id=project_id, quarter_id=quarter_id, assigned_to_id=assigned_to_id,
                 assigned_by_id=current_user.id, reviewer_id=reviewer_id, parent_id=parent_id,
@@ -375,6 +386,12 @@ async def update_task(
         await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
     if start_date is not None:
         task.start_date = start_date
+    if deadline is not None or start_date is not None:
+        new_dl = deadline if deadline is not None else task.deadline
+        new_sd = start_date if start_date is not None else task.start_date
+        new_q_id = await _determine_quarter_id(db, new_dl or new_sd)
+        if new_q_id:
+            task.quarter_id = new_q_id
     if estimated_hours is not None:
         task.estimated_hours = estimated_hours
     if assigned_to_id is not None and assigned_to_id != task.assigned_to_id:
@@ -434,7 +451,7 @@ async def get_task(
 @router.put("/{task_id}/status")
 async def update_status(
     *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
-    task_id: int, status: str,
+    task_id: int, status: str, reason: Optional[str] = None,
 ) -> Any:
     r = await db.execute(select(Task).filter(Task.id == task_id, Task.is_deleted == False))
     task = r.scalars().first()
@@ -442,7 +459,10 @@ async def update_status(
         return error_response(message="Task not found")
     old = task.status.value if task.status else None
     task.status = status
-    await _add_history(db, task_id, "status_changed", f"Status: {old} → {status}", old_val=old, new_val=status, user_id=current_user.id)
+    desc = f"Status: {old} → {status}"
+    if status == "blocked" and reason:
+        desc += f" (Reason: {reason})"
+    await _add_history(db, task_id, "status_changed", desc, old_val=old, new_val=status, user_id=current_user.id)
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
     await db.commit()
@@ -599,7 +619,7 @@ async def get_performance(
         return error_response(message="User not found")
     base = [Task.assigned_to_id == user_id, Task.is_deleted == False]
     if quarter_id:
-        base.append(Task.quarter_id == quarter_id)
+        base.append(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
 
     total = (await db.execute(select(func.count()).select_from(Task).where(*base))).scalar() or 0
     completed = (await db.execute(select(func.count()).select_from(Task).where(*base, Task.status == TaskStatusEnum.completed))).scalar() or 0
