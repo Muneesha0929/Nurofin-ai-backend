@@ -30,6 +30,28 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
     if t.project_id:
         from app.models.project import Project
         project = (await db.execute(select(Project).filter(Project.id == t.project_id))).scalars().first()
+    # Fetch latest transfer history
+    transfer_date = None
+    transfer_to_name = None
+    try:
+        from app.models.task_history import TaskHistory
+        hist_res = await db.execute(
+            select(TaskHistory)
+            .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
+            .order_by(TaskHistory.created_at.desc())
+            .limit(1)
+        )
+        latest_assigned_history = hist_res.scalars().first()
+        if latest_assigned_history:
+            transfer_date = latest_assigned_history.created_at.strftime("%Y-%m-%d") if latest_assigned_history.created_at else None
+            if latest_assigned_history.new_value and latest_assigned_history.new_value != "None" and latest_assigned_history.new_value.isdigit():
+                new_assignee_id = int(latest_assigned_history.new_value)
+                t_user = (await db.execute(select(User).filter(User.id == new_assignee_id))).scalars().first()
+                if t_user:
+                    transfer_to_name = t_user.full_name
+    except Exception:
+        pass
+
     return {
         "id": t.id, "title": t.title, "description": t.description,
         "status": t.status.value if hasattr(t.status, 'value') else (t.status or "todo"),
@@ -48,6 +70,8 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
         "parent_id": t.parent_id, "quarter_id": t.quarter_id,
         "meeting_id": t.meeting_id, "subtasks": subtasks,
         "created_at": t.created_at.isoformat() if t.created_at else None,
+        "transfer_date": transfer_date,
+        "transfer_to_name": transfer_to_name,
     }
 
 
