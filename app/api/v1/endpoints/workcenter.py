@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, aliased
-from sqlalchemy import func, or_, case, exists, select
+from sqlalchemy import func, or_, case, exists, select, update
 from typing import Any, Optional, List
 from datetime import datetime
 
@@ -30,6 +30,28 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
     if t.project_id:
         from app.models.project import Project
         project = (await db.execute(select(Project).filter(Project.id == t.project_id))).scalars().first()
+    # Fetch latest transfer history
+    transfer_date = None
+    transfer_to_name = None
+    try:
+        from app.models.task_history import TaskHistory
+        hist_res = await db.execute(
+            select(TaskHistory)
+            .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
+            .order_by(TaskHistory.created_at.desc())
+            .limit(1)
+        )
+        latest_assigned_history = hist_res.scalars().first()
+        if latest_assigned_history:
+            transfer_date = latest_assigned_history.created_at.strftime("%Y-%m-%d") if latest_assigned_history.created_at else None
+            if latest_assigned_history.new_value and latest_assigned_history.new_value != "None" and latest_assigned_history.new_value.isdigit():
+                new_assignee_id = int(latest_assigned_history.new_value)
+                t_user = (await db.execute(select(User).filter(User.id == new_assignee_id))).scalars().first()
+                if t_user:
+                    transfer_to_name = t_user.full_name
+    except Exception:
+        pass
+
     return {
         "id": t.id, "title": t.title, "description": t.description,
         "status": t.status.value if hasattr(t.status, 'value') else (t.status or "todo"),
@@ -48,6 +70,8 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
         "parent_id": t.parent_id, "quarter_id": t.quarter_id,
         "meeting_id": t.meeting_id, "subtasks": subtasks,
         "created_at": t.created_at.isoformat() if t.created_at else None,
+        "transfer_date": transfer_date,
+        "transfer_to_name": transfer_to_name,
     }
 
 
@@ -335,12 +359,36 @@ async def create_task(
     reviewer_id: int = None, parent_id: int = None, deadline: str = None,
     start_date: str = None, estimated_hours: float = None,
 ) -> Any:
-    if not quarter_id:
-        quarter_id = await _determine_quarter_id(db, deadline or start_date)
-    task = Task(title=title, description=description, priority=priority,
-                project_id=project_id, quarter_id=quarter_id, assigned_to_id=assigned_to_id,
-                assigned_by_id=current_user.id, reviewer_id=reviewer_id, parent_id=parent_id,
-                deadline=deadline, start_date=start_date, estimated_hours=estimated_hours)
+    # Handle sentinels from frontend
+    actual_project_id = None if (project_id == 0 or project_id is None) else project_id
+    actual_quarter_id = None if (quarter_id == 0 or quarter_id is None) else quarter_id
+    actual_assigned_to_id = None if (assigned_to_id == 0 or assigned_to_id is None) else assigned_to_id
+    actual_reviewer_id = None if (reviewer_id == 0 or reviewer_id is None) else reviewer_id
+    actual_parent_id = None if (parent_id == 0 or parent_id is None) else parent_id
+    
+    actual_deadline = None if deadline == "" else deadline
+    actual_start_date = None if start_date == "" else start_date
+    actual_description = None if description == "" else description
+    actual_estimated_hours = None if (estimated_hours is not None and estimated_hours < 0) else estimated_hours
+    
+    # If subtask, inherit parent dates/quarter if not explicitly set
+    if actual_parent_id:
+        parent_r = await db.execute(select(Task).filter(Task.id == actual_parent_id))
+        parent = parent_r.scalars().first()
+        if parent:
+            if not actual_start_date:
+                actual_start_date = parent.start_date
+            if not actual_deadline:
+                actual_deadline = parent.deadline
+            if not actual_quarter_id:
+                actual_quarter_id = parent.quarter_id
+                
+    if not actual_quarter_id:
+        actual_quarter_id = await _determine_quarter_id(db, actual_deadline or actual_start_date)
+    task = Task(title=title, description=actual_description, priority=priority,
+                project_id=actual_project_id, quarter_id=actual_quarter_id, assigned_to_id=actual_assigned_to_id,
+                assigned_by_id=current_user.id, reviewer_id=actual_reviewer_id, parent_id=actual_parent_id,
+                deadline=actual_deadline, start_date=actual_start_date, estimated_hours=actual_estimated_hours)
     db.add(task)
     await db.flush()
     await _add_history(db, task.id, "created", "Task created", user_id=current_user.id)
@@ -367,13 +415,19 @@ async def update_task(
     priority: str = None, deadline: str = None, start_date: str = None,
     estimated_hours: float = None, assigned_to_id: int = None,
     reviewer_id: int = None, progress: float = None,
+    project_id: int = None, quarter_id: int = None,
 ) -> Any:
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id, Task.is_deleted == False))
     task = r.scalars().first()
     if not task:
         return error_response(message="Task not found")
+        
+    old_project_id = task.project_id
+    
     if title is not None:
         task.title = title
+    if description is not None:
+        task.description = description if description != "" else None
     if status is not None:
         old = task.status.value if task.status else None
         task.status = status
@@ -382,35 +436,74 @@ async def update_task(
         task.priority = priority
     if deadline is not None:
         old_dl = task.deadline
-        task.deadline = deadline
+        task.deadline = deadline if deadline != "" else None
         await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+        # Propagate deadline to subtasks
+        await db.execute(
+            update(Task)
+            .where(Task.parent_id == task_id, Task.is_deleted == False)
+            .values(deadline=task.deadline)
+        )
     if start_date is not None:
-        task.start_date = start_date
+        task.start_date = start_date if start_date != "" else None
+        # Propagate start_date to subtasks
+        await db.execute(
+            update(Task)
+            .where(Task.parent_id == task_id, Task.is_deleted == False)
+            .values(start_date=task.start_date)
+        )
+        
     if deadline is not None or start_date is not None:
         new_dl = deadline if deadline is not None else task.deadline
         new_sd = start_date if start_date is not None else task.start_date
         new_q_id = await _determine_quarter_id(db, new_dl or new_sd)
         if new_q_id:
             task.quarter_id = new_q_id
+            # Propagate quarter_id to subtasks
+            await db.execute(
+                update(Task)
+                .where(Task.parent_id == task_id, Task.is_deleted == False)
+                .values(quarter_id=new_q_id)
+            )
+            
     if estimated_hours is not None:
-        task.estimated_hours = estimated_hours
-    if assigned_to_id is not None and assigned_to_id != task.assigned_to_id:
-        old_a = task.assigned_to_id
-        task.assigned_to_id = assigned_to_id
-        await _add_history(db, task_id, "assigned", "Reassigned", old_val=str(old_a), new_val=str(assigned_to_id), user_id=current_user.id)
-        if assigned_to_id:
-            db.add(Notification(title="Task assigned", message=f"You have been assigned: {task.title}",
-                               type=NotificationTypeEnum.task_assigned, user_id=assigned_to_id, link=f"/tasks?id={task_id}"))
+        task.estimated_hours = estimated_hours if estimated_hours >= 0 else None
+        
+    if assigned_to_id is not None:
+        actual_assignee_id = None if assigned_to_id == 0 else assigned_to_id
+        if actual_assignee_id != task.assigned_to_id:
+            old_a = task.assigned_to_id
+            task.assigned_to_id = actual_assignee_id
+            await _add_history(db, task_id, "assigned", "Reassigned", old_val=str(old_a), new_val=str(actual_assignee_id), user_id=current_user.id)
+            if actual_assignee_id:
+                db.add(Notification(title="Task assigned", message=f"You have been assigned: {task.title}",
+                                   type=NotificationTypeEnum.task_assigned, user_id=actual_assignee_id, link=f"/tasks?id={task_id}"))
+                                   
     if reviewer_id is not None:
-        task.reviewer_id = reviewer_id
+        task.reviewer_id = None if reviewer_id == 0 else reviewer_id
+        
+    if project_id is not None:
+        task.project_id = None if project_id == 0 else project_id
+        
+    if quarter_id is not None:
+        task.quarter_id = None if quarter_id == 0 else quarter_id
+        
     if progress is not None:
         task.progress = progress
+        
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
+        
     await db.commit()
-    await _recalculate_project_progress(db, task.project_id)
+    
+    if task.project_id:
+        await _recalculate_project_progress(db, task.project_id)
+    if old_project_id and old_project_id != task.project_id:
+        await _recalculate_project_progress(db, old_project_id)
+        
     if task.parent_id:
         await _recalculate_parent_progress(db, task.parent_id)
+        
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))
     task = r.scalars().first()
     return success_response(data=await _serialize_task(db, task))

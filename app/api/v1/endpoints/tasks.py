@@ -198,6 +198,19 @@ async def update_task(
         
     if task.assigned_to_id and task.assigned_to_id != old_assigned_to_id:
         await _create_task_assignment_notification(db, task, current_user)
+        # Add task history record for legacy update
+        try:
+            from app.models.task_history import TaskHistory
+            db.add(TaskHistory(
+                task_id=task.id,
+                action="assigned",
+                description="Reassigned",
+                old_value=str(old_assigned_to_id),
+                new_value=str(task.assigned_to_id),
+                performed_by_id=current_user.id
+            ))
+        except Exception:
+            pass
 
     await db.commit()
 
