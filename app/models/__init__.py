@@ -8,6 +8,9 @@ from .meeting import (
     MeetingParticipant, MeetingTimeline, MeetingExtractedTask,
 )
 from .issue import Issue, IssueStatusEnum, IssuePriorityEnum
+from .issue_followup import IssueFollowup
+from .finance_record import FinanceRecord, FinanceRecordTypeEnum, FinanceRecordStatusEnum
+from .performance_review import PerformanceReview
 from .knowledge import Knowledge
 from .knowledge_chunk import KnowledgeChunk
 from .notification import Notification, NotificationTypeEnum

@@ -13,6 +13,8 @@ from app.api.v1.endpoints import (
     knowledge,
     stream,
     documents,
+    issues,
+    finance,
 )
 
 api_router = APIRouter()
@@ -30,3 +32,5 @@ api_router.include_router(workcenter.router, prefix="/workcenter", tags=["workce
 api_router.include_router(knowledge.router, prefix="/knowledge", tags=["knowledge"])
 api_router.include_router(stream.router, prefix="/stream", tags=["stream"])
 api_router.include_router(documents.router, prefix="/documents", tags=["documents"])
+api_router.include_router(issues.router, prefix="/issues", tags=["issues"])
+api_router.include_router(finance.router, prefix="/finance", tags=["finance"])

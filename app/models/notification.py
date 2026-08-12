@@ -18,6 +18,10 @@ class NotificationTypeEnum(str, enum.Enum):
     meeting_mom_uploaded = "meeting_mom_uploaded"
     meeting_tasks_extracted = "meeting_tasks_extracted"
     meeting_task_assigned = "meeting_task_assigned"
+    issue_assigned = "issue_assigned"
+    issue_followup = "issue_followup"
+    issue_status_changed = "issue_status_changed"
+    performance_reviewed = "performance_reviewed"
 
 class Notification(Base):
     id = Column(Integer, primary_key=True, index=True)
