@@ -22,7 +22,8 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
     subtasks = []
     if load_subtasks and hasattr(t, "subtasks") and t.subtasks:
         for s in t.subtasks:
-            subtasks.append(await _serialize_task(db, s, load_subtasks=False))
+            if not getattr(s, "is_deleted", False):
+                subtasks.append(await _serialize_task(db, s, load_subtasks=False))
     assignee = (await db.execute(select(User).filter(User.id == t.assigned_to_id))).scalars().first() if t.assigned_to_id else None
     assigner = (await db.execute(select(User).filter(User.id == t.assigned_by_id))).scalars().first() if t.assigned_by_id else None
     reviewer = (await db.execute(select(User).filter(User.id == t.reviewer_id))).scalars().first() if t.reviewer_id else None
