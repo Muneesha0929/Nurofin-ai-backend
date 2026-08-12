@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, aliased
-from sqlalchemy import func, or_, case, exists, select
+from sqlalchemy import func, or_, case, exists, select, update
 from typing import Any, Optional, List
 from datetime import datetime
 
@@ -371,6 +371,18 @@ async def create_task(
     actual_description = None if description == "" else description
     actual_estimated_hours = None if (estimated_hours is not None and estimated_hours < 0) else estimated_hours
     
+    # If subtask, inherit parent dates/quarter if not explicitly set
+    if actual_parent_id:
+        parent_r = await db.execute(select(Task).filter(Task.id == actual_parent_id))
+        parent = parent_r.scalars().first()
+        if parent:
+            if not actual_start_date:
+                actual_start_date = parent.start_date
+            if not actual_deadline:
+                actual_deadline = parent.deadline
+            if not actual_quarter_id:
+                actual_quarter_id = parent.quarter_id
+                
     if not actual_quarter_id:
         actual_quarter_id = await _determine_quarter_id(db, actual_deadline or actual_start_date)
     task = Task(title=title, description=actual_description, priority=priority,
@@ -426,8 +438,20 @@ async def update_task(
         old_dl = task.deadline
         task.deadline = deadline if deadline != "" else None
         await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+        # Propagate deadline to subtasks
+        await db.execute(
+            update(Task)
+            .where(Task.parent_id == task_id, Task.is_deleted == False)
+            .values(deadline=task.deadline)
+        )
     if start_date is not None:
         task.start_date = start_date if start_date != "" else None
+        # Propagate start_date to subtasks
+        await db.execute(
+            update(Task)
+            .where(Task.parent_id == task_id, Task.is_deleted == False)
+            .values(start_date=task.start_date)
+        )
         
     if deadline is not None or start_date is not None:
         new_dl = deadline if deadline is not None else task.deadline
@@ -435,6 +459,12 @@ async def update_task(
         new_q_id = await _determine_quarter_id(db, new_dl or new_sd)
         if new_q_id:
             task.quarter_id = new_q_id
+            # Propagate quarter_id to subtasks
+            await db.execute(
+                update(Task)
+                .where(Task.parent_id == task_id, Task.is_deleted == False)
+                .values(quarter_id=new_q_id)
+            )
             
     if estimated_hours is not None:
         task.estimated_hours = estimated_hours if estimated_hours >= 0 else None
