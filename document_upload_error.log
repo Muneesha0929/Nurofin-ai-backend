@@ -1,0 +1,153 @@
+Traceback (most recent call last):
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1969, in _exec_single_context
+    self.dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        cursor, str_statement, effective_parameters, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 952, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\dialects\postgresql\psycopg.py", line 642, in execute
+    result = self.await_(self._cursor.execute(query, params, **kw))
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 132, in await_only
+    return current.parent.switch(awaitable)  # type: ignore[no-any-return,attr-defined] # noqa: E501
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 196, in greenlet_spawn
+    value = await result
+            ^^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\psycopg\cursor_async.py", line 117, in execute
+    raise ex.with_traceback(None)
+psycopg.errors.UndefinedColumn: column documentuseraccess.granted_at does not exist
+LINE 1: ...T TIME ZONE, $5) RETURNING documentuseraccess.id, documentus...
+                                                             ^
+HINT:  Perhaps you meant to reference the column "documentuseraccess.created_at".
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\Nurofin-ai-backend\app\api\v1\endpoints\documents.py", line 139, in create_document
+    await db.commit()
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\ext\asyncio\session.py", line 999, in commit
+    await greenlet_spawn(self.sync_session.commit)
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 203, in greenlet_spawn
+    result = context.switch(value)
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 2035, in commit
+    trans.commit(_to_root=True)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "<string>", line 2, in commit
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\state_changes.py", line 137, in _go
+    ret_value = fn(self, *arg, **kw)
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 1316, in commit
+    self._prepare_impl()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "<string>", line 2, in _prepare_impl
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\state_changes.py", line 137, in _go
+    ret_value = fn(self, *arg, **kw)
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 1290, in _prepare_impl
+    self.session.flush()
+    ~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4353, in flush
+    self._flush(objects)
+    ~~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4488, in _flush
+    with util.safe_reraise():
+         ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\langhelpers.py", line 122, in __exit__
+    raise exc_value.with_traceback(exc_tb)
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\session.py", line 4449, in _flush
+    flush_context.execute()
+    ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py", line 465, in execute
+    rec.execute(self)
+    ~~~~~~~~~~~^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\unitofwork.py", line 641, in execute
+    util.preloaded.orm_persistence.save_obj(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self.mapper,
+        ^^^^^^^^^^^^
+        uow.states_for_mapper_hierarchy(self.mapper, False, False),
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        uow,
+        ^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\persistence.py", line 94, in save_obj
+    _emit_insert_statements(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        base_mapper,
+        ^^^^^^^^^^^^
+    ...<3 lines>...
+        insert,
+        ^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\orm\persistence.py", line 1234, in _emit_insert_statements
+    result = connection.execute(
+        statement,
+        params,
+        execution_options=execution_options,
+    )
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1421, in execute
+    return meth(
+        self,
+        distilled_parameters,
+        execution_options or NO_OPTIONS,
+    )
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\sql\elements.py", line 526, in _execute_on_connection
+    return connection._execute_clauseelement(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self, distilled_params, execution_options
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1643, in _execute_clauseelement
+    ret = self._execute_context(
+        dialect,
+    ...<8 lines>...
+        cache_hit=cache_hit,
+    )
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1848, in _execute_context
+    return self._exec_single_context(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~^
+        dialect, context, statement, parameters
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1988, in _exec_single_context
+    self._handle_dbapi_exception(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        e, str_statement, effective_parameters, cursor, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 2365, in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\base.py", line 1969, in _exec_single_context
+    self.dialect.do_execute(
+    ~~~~~~~~~~~~~~~~~~~~~~~^
+        cursor, str_statement, effective_parameters, context
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\engine\default.py", line 952, in do_execute
+    cursor.execute(statement, parameters)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\dialects\postgresql\psycopg.py", line 642, in execute
+    result = self.await_(self._cursor.execute(query, params, **kw))
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 132, in await_only
+    return current.parent.switch(awaitable)  # type: ignore[no-any-return,attr-defined] # noqa: E501
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\sqlalchemy\util\_concurrency_py3k.py", line 196, in greenlet_spawn
+    value = await result
+            ^^^^^^^^^^^^
+  File "C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\venv\Lib\site-packages\psycopg\cursor_async.py", line 117, in execute
+    raise ex.with_traceback(None)
+sqlalchemy.exc.ProgrammingError: (psycopg.errors.UndefinedColumn) column documentuseraccess.granted_at does not exist
+LINE 1: ...T TIME ZONE, $5) RETURNING documentuseraccess.id, documentus...
+                                                             ^
+HINT:  Perhaps you meant to reference the column "documentuseraccess.created_at".
+[SQL: INSERT INTO documentuseraccess (document_id, user_id, created_at, updated_at, is_deleted) VALUES (%(document_id)s::INTEGER, %(user_id)s::INTEGER, %(created_at)s::TIMESTAMP WITHOUT TIME ZONE, %(updated_at)s::TIMESTAMP WITHOUT TIME ZONE, %(is_deleted)s) RETURNING documentuseraccess.id, documentuseraccess.granted_at]
+[parameters: {'document_id': 8, 'user_id': 5, 'created_at': datetime.datetime(2026, 8, 12, 18, 5, 24, 34318), 'updated_at': datetime.datetime(2026, 8, 12, 18, 5, 24, 34336), 'is_deleted': False}]
+(Background on this error at: https://sqlalche.me/e/20/f405)

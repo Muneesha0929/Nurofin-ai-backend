@@ -26,7 +26,7 @@ async def get_current_user(
             if user_id:
                 result = await db.execute(select(User).filter(User.id == int(user_id)))
                 user = result.scalars().first()
-        except Exception:
+        except JWTError:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Could not validate credentials",

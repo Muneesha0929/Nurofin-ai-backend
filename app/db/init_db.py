@@ -1,5 +1,6 @@
 import asyncio
 from sqlalchemy.future import select
+from sqlalchemy import text
 from app.db.base_class import Base
 from app.db.session import SessionLocal, engine
 
@@ -112,6 +113,27 @@ ALL_PERMISSIONS = ["read_finance", "write_finance", "edit_tasks", "access_ai", "
 FINANCE_PERMISSIONS = ["read_finance", "write_finance", "access_ai"]
 TECH_LEAD_PERMISSIONS = ["edit_tasks", "access_ai"]
 
+async def ensure_columns(db) -> None:
+    """Add missing columns to existing tables (create_all does not alter tables)."""
+    try:
+        dialect = engine.dialect.name
+        if dialect != "postgresql":
+            return
+        stmts = [
+            "ALTER TABLE issue ADD COLUMN IF NOT EXISTS reported_by_id INTEGER",
+            "ALTER TABLE issue ADD COLUMN IF NOT EXISTS deadline VARCHAR",
+            "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS salary FLOAT",
+            "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS performance_score FLOAT",
+            "ALTER TABLE notification ADD COLUMN IF NOT EXISTS link VARCHAR",
+        ]
+        for stmt in stmts:
+            await db.execute(text(stmt))
+        await db.commit()
+    except Exception as e:
+        print(f"Database Initialization: Column sync skipped: {e}")
+        await db.rollback()
+
+
 async def init_db() -> None:
     """
     Automatically creates all tables and seeds default data (CEO user and roles)
@@ -128,6 +150,7 @@ async def init_db() -> None:
 
     async with SessionLocal() as db:
         try:
+            await ensure_columns(db)
             admin_email = "vincent@nurofin.com"
             result = await db.execute(select(User).filter(User.email == admin_email))
             user = result.scalars().first()

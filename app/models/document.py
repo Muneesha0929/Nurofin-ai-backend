@@ -9,6 +9,7 @@ class Document(Base):
     s3_key = Column(String, unique=True, index=True, nullable=False)
     url = Column(String, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    is_deleted = Column(Boolean, default=False)
     
     # Linkage
     project_id = Column(Integer, ForeignKey("project.id"), nullable=True)
@@ -32,6 +33,7 @@ class DocumentUserAccess(Base):
     id = Column(Integer, primary_key=True, index=True)
     document_id = Column(Integer, ForeignKey("document.id", ondelete="CASCADE"))
     user_id = Column(Integer, ForeignKey("user.id", ondelete="CASCADE"))
+    granted_at = Column(DateTime(timezone=True), server_default=func.now())
     
     document = relationship("Document", back_populates="allowed_users")
     user = relationship("User")

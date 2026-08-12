@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, Enum, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, Enum, DateTime, Float
 from sqlalchemy.orm import relationship
 import enum
 from app.db.base_class import Base
@@ -24,6 +24,10 @@ class User(Base):
     phone = Column(String)
     profile_picture = Column(String)
     is_active = Column(Boolean(), default=True)
+    
+    # Compensation & Performance
+    salary = Column(Float, default=0.0)
+    performance_score = Column(Float, default=0.0)
     
     # Google Calendar Integration
     google_access_token = Column(String, nullable=True)
