@@ -485,10 +485,93 @@ async def check_availability(
     if conflicting_tasks:
         reasons.append("busy working on a task")
         
+    # Check Google Calendar
+    conflicting_google = []
+    busy_blocks_google = []
+    try:
+        from datetime import datetime
+        req_start_dt = datetime.strptime(start_time, "%H:%M").time()
+        req_end_dt = datetime.strptime(end_time, "%H:%M").time()
+        
+        target_user_res = await db.execute(select(User).filter(User.id == user_id))
+        target_user = target_user_res.scalars().first()
+        if target_user and target_user.google_access_token:
+            from app.services.google_calendar import fetch_calendar_events
+            time_min = datetime.fromisoformat(date + "T00:00:00+00:00")
+            time_max = datetime.fromisoformat(date + "T23:59:59+00:00")
+            g_events = fetch_calendar_events(target_user, time_min, time_max)
+            for item in g_events:
+                st = item['start'].get('dateTime', item['start'].get('date'))
+                et = item['end'].get('dateTime', item['end'].get('date'))
+                if st and et:
+                    try:
+                        busy_blocks_google.append({"start": st, "end": et})
+                        b_s = datetime.fromisoformat(st.replace('Z', '+00:00')).time()
+                        b_e = datetime.fromisoformat(et.replace('Z', '+00:00')).time()
+                        if req_start_dt < b_e and req_end_dt > b_s:
+                            conflicting_google.append(item)
+                    except:
+                        pass
+    except Exception as e:
+        print(f"Error checking google calendar: {e}")
+        pass
+
+    if conflicting_google:
+        is_busy = True
+        reasons.append("busy with Google Calendar event")
+        
     status_color = "red" if is_busy else "green"
+    
+    alternative_times = []
+    if is_busy:
+        try:
+            from datetime import datetime
+            from app.api.v1.endpoints.meetings import get_alternative_times
+            
+            req_start_dt = datetime.strptime(start_time, "%H:%M")
+            req_end_dt = datetime.strptime(end_time, "%H:%M")
+            duration_mins = int((req_end_dt - req_start_dt).total_seconds() / 60)
+            if duration_mins <= 0:
+                duration_mins = 60
+                
+            # Get all busy blocks for the user on this date
+            day_meetings_res = await db.execute(
+                select(Meeting).join(MeetingParticipant).filter(
+                    MeetingParticipant.user_id == user_id,
+                    MeetingParticipant.status != ParticipantStatusEnum.declined,
+                    Meeting.date == date,
+                    Meeting.is_deleted == False
+                )
+            )
+            day_tasks_res = await db.execute(
+                select(Task).filter(
+                    Task.assigned_to_id == user_id,
+                    Task.scheduled_date == date
+                )
+            )
+            
+            busy_blocks = []
+            for m in day_meetings_res.scalars().all():
+                busy_blocks.append({"start_time": m.start_time, "end_time": m.end_time})
+            for t in day_tasks_res.scalars().all():
+                if t.scheduled_start_time and t.scheduled_end_time:
+                    busy_blocks.append({"start_time": t.scheduled_start_time, "end_time": t.scheduled_end_time})
+                    
+            for bbg in busy_blocks_google:
+                try:
+                    s_str = datetime.fromisoformat(bbg['start'].replace('Z', '+00:00')).strftime("%H:%M")
+                    e_str = datetime.fromisoformat(bbg['end'].replace('Z', '+00:00')).strftime("%H:%M")
+                    busy_blocks.append({"start_time": s_str, "end_time": e_str})
+                except:
+                    pass
+                    
+            alternative_times = get_alternative_times(busy_blocks, date, duration_mins)
+        except Exception as e:
+            print(f"Error calculating alternative times: {e}")
+            pass
         
     return success_response(
-        data={"is_busy": is_busy, "reasons": reasons, "status_color": status_color},
+        data={"is_busy": is_busy, "reasons": reasons, "status_color": status_color, "alternative_times": alternative_times},
         message="Availability checked successfully"
     )
 

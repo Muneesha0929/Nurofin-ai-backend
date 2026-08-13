@@ -187,12 +187,8 @@ async def read_meetings(
         .filter(Meeting.is_deleted == False)
     )
     
-    if (current_user.role or "").lower() not in ["super_admin", "admin", "ceo"]:
-        stmt = stmt.outerjoin(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
-        stmt = stmt.filter(
-            (Meeting.owner_id == current_user.id) | 
-            (MeetingParticipant.user_id == current_user.id)
-        )
+    # Team scheduling requires all users to see all meetings to check availability.
+    # If privacy is needed later, we can mask the title/description instead of filtering.
 
     if filter:
         today_date = datetime.now()
