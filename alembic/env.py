@@ -14,6 +14,9 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # add your model's MetaData object here
 # for 'autogenerate' support
 import os
