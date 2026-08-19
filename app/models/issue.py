@@ -16,15 +16,30 @@ class IssuePriorityEnum(str, enum.Enum):
     high = "high"
     critical = "critical"
 
+class IssueTypeEnum(str, enum.Enum):
+    bug = "bug"
+    feature = "feature"
+    general = "general"
+
+class IssueAssignmentStatusEnum(str, enum.Enum):
+    pending_acceptance = "pending_acceptance"
+    accepted = "accepted"
+
 class Issue(Base):
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String, index=True, nullable=False)
     description = Column(String)
     category = Column(String)
+    issue_type = Column(Enum(IssueTypeEnum), default=IssueTypeEnum.general)
     priority = Column(Enum(IssuePriorityEnum), default=IssuePriorityEnum.medium)
     status = Column(Enum(IssueStatusEnum), default=IssueStatusEnum.open)
     attachments = Column(JSON, default=[]) # Storing list of URLs
     deadline = Column(String, nullable=True)
+    
+    # Auto-assignment & timeouts
+    assignment_status = Column(Enum(IssueAssignmentStatusEnum), nullable=True)
+    assignment_timestamp = Column(DateTime, nullable=True)
+    declined_by_users = Column(JSON, default=[]) # List of user IDs who declined/timed out
     
     project_id = Column(Integer, ForeignKey("project.id"), nullable=True)
     assigned_user_id = Column(Integer, ForeignKey("user.id"), nullable=True)

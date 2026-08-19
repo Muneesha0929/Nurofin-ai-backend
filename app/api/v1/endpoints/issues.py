@@ -60,6 +60,9 @@ def _serialize_issue(db: AsyncSession, issue: Issue) -> dict:
         } if issue.project else None,
         "assigned_user_id": issue.assigned_user_id,
         "assigned_user": _user_brief(issue.assigned_user),
+        "assignment_status": issue.assignment_status.value if hasattr(issue.assignment_status, "value") else issue.assignment_status,
+        "assignment_timestamp": _fmt_date(issue.assignment_timestamp),
+        "issue_type": issue.issue_type.value if hasattr(issue.issue_type, "value") else issue.issue_type,
         "reported_by_id": issue.reported_by_id,
         "reported_by": _user_brief(issue.reported_by),
         "followup_count": followup_count,
@@ -163,6 +166,9 @@ async def create_issue(
     issue_in: IssueCreate,
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
+    from datetime import datetime
+    from app.models.issue import IssueAssignmentStatusEnum
+
     data = issue_in.dict(exclude_unset=True)
 
     if data.get("assigned_user_id"):
@@ -174,15 +180,47 @@ async def create_issue(
         if not project:
             return error_response(message="Project not found")
 
+    # Auto-assignment logic
+    if not data.get("assigned_user_id") and data.get("project_id"):
+        # Find all users in the project excluding the CEO
+        from app.models.project import project_members
+        stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
+            project_members.c.project_id == data["project_id"], 
+            User.is_deleted == False
+        )
+        proj_members = [m for m in (await db.execute(stmt)).scalars().all() if m.role != "ceo" and getattr(m.role, "value", m.role) != "ceo"]
+        
+        if proj_members:
+            # Simple free-time check: assign to the person with the fewest open issues
+            member_ids = [m.id for m in proj_members]
+            issue_counts = await db.execute(
+                select(Issue.assigned_user_id, func.count(Issue.id))
+                .filter(Issue.assigned_user_id.in_(member_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
+                .group_by(Issue.assigned_user_id)
+            )
+            counts_dict = {row[0]: row[1] for row in issue_counts}
+            
+            # Sort members by number of active issues
+            proj_members.sort(key=lambda m: counts_dict.get(m.id, 0))
+            best_assignee = proj_members[0]
+            
+            data["assigned_user_id"] = best_assignee.id
+            data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
+            data["assignment_timestamp"] = datetime.utcnow()
+    # If assigned to anyone (either explicitly or via auto-assign), set to pending acceptance
+    if data.get("assigned_user_id") and not data.get("assignment_status"):
+        data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
+        data["assignment_timestamp"] = datetime.utcnow()
+
     db_issue = Issue(**data, reported_by_id=current_user.id)
     db.add(db_issue)
     await db.flush()
 
     if data.get("assigned_user_id"):
         db.add(Notification(
-            title="New issue assigned to you",
-            message=f"{current_user.full_name or 'Someone'} reported: {data.get('title', 'Issue')}",
-            type=NotificationTypeEnum.issue_assigned,
+            title="New issue assigned to you (Action Required)",
+            message=f"{current_user.full_name or 'Someone'} reported: {data.get('title', 'Issue')}. Please accept or decline within 1 hour.",
+            type=NotificationTypeEnum.task_assigned,
             user_id=data["assigned_user_id"],
             link=f"/issues?id={db_issue.id}",
         ))
@@ -249,7 +287,7 @@ async def update_issue(
         db.add(Notification(
             title="Issue assigned to you",
             message=f"{current_user.full_name or 'Someone'} assigned: {issue.title}",
-            type=NotificationTypeEnum.issue_assigned,
+            type=NotificationTypeEnum.task_assigned,
             user_id=update_data["assigned_user_id"],
             link=f"/issues?id={issue.id}",
         ))
@@ -260,7 +298,7 @@ async def update_issue(
         db.add(Notification(
             title="Issue status updated",
             message=f"Your reported issue '{issue.title}' is now {new_status.replace('_', ' ')}.",
-            type=NotificationTypeEnum.issue_status_changed,
+            type=NotificationTypeEnum.project_update,
             user_id=issue.reported_by_id,
             link=f"/issues?id={issue.id}",
         ))
@@ -306,22 +344,30 @@ async def update_issue_status(
     issue.status = status
     await db.flush()
 
-    if old_status != status and issue.reported_by_id and issue.reported_by_id != current_user.id:
-        db.add(Notification(
-            title="Issue status updated",
-            message=f"Your reported issue '{issue.title}' is now {status.replace('_', ' ')}.",
-            type=NotificationTypeEnum.issue_status_changed,
-            user_id=issue.reported_by_id,
-            link=f"/issues?id={issue.id}",
-        ))
-    if old_status != status and issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.assigned_user_id != issue.reported_by_id:
-        db.add(Notification(
-            title="Issue status updated",
-            message=f"Issue '{issue.title}' is now {status.replace('_', ' ')}.",
-            type=NotificationTypeEnum.issue_status_changed,
-            user_id=issue.assigned_user_id,
-            link=f"/issues?id={issue.id}",
-        ))
+    if old_status != status:
+        if issue.reported_by_id and issue.reported_by_id != current_user.id:
+            db.add(Notification(
+                title="Issue status updated",
+                message=f"Your reported issue '{issue.title}' is now {status.replace('_', ' ')}.",
+                type=NotificationTypeEnum.project_update,
+                user_id=issue.reported_by_id,
+                link=f"/issues?id={issue.id}",
+            ))
+            # If completed/resolved, we also simulate sending an email to the reporter/client
+            if status in [IssueStatusEnum.resolved.value, IssueStatusEnum.closed.value]:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"Sending completion email to client (User ID: {issue.reported_by_id}) for Issue {issue.id}")
+                # TODO: Integrate actual email service here (e.g. Amazon SES, SendGrid)
+
+        if issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.assigned_user_id != issue.reported_by_id:
+            db.add(Notification(
+                title="Issue status updated",
+                message=f"Issue '{issue.title}' is now {status.replace('_', ' ')}.",
+                type=NotificationTypeEnum.project_update,
+                user_id=issue.assigned_user_id,
+                link=f"/issues?id={issue.id}",
+            ))
 
     await db.commit()
     loaded = await _load_issue(db, issue_id)
@@ -373,7 +419,7 @@ async def create_followup(
         db.add(Notification(
             title="New follow-up on your reported issue",
             message=f"{current_user.full_name or 'Someone'} commented on '{issue.title}'",
-            type=NotificationTypeEnum.issue_followup,
+            type=NotificationTypeEnum.project_update,
             user_id=issue.reported_by_id,
             link=f"/issues?id={issue.id}",
         ))
@@ -381,11 +427,202 @@ async def create_followup(
         db.add(Notification(
             title="New follow-up on issue",
             message=f"{current_user.full_name or 'Someone'} commented on '{issue.title}'",
-            type=NotificationTypeEnum.issue_followup,
+            type=NotificationTypeEnum.project_update,
             user_id=issue.assigned_user_id,
             link=f"/issues?id={issue.id}",
         ))
 
     await db.commit()
-    await db.refresh(db_followup)
-    return success_response(data=await _serialize_followup(db_followup), message="Follow-up added successfully")
+    loaded_followup = await db.get(IssueFollowup, db_followup.id)
+    return success_response(
+        data=await _serialize_followup(loaded_followup),
+        message="Follow-up added successfully"
+    )
+
+@router.post("/{issue_id}/accept", response_model=APIResponse)
+async def accept_issue(
+    issue_id: int,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    from app.models.issue import IssueAssignmentStatusEnum
+    issue = await _load_issue(db, issue_id)
+    if not issue:
+        return error_response(message="Issue not found")
+    
+    if issue.assigned_user_id != current_user.id:
+        return error_response(message="Only the assigned user can accept this issue")
+        
+    if issue.assignment_status == IssueAssignmentStatusEnum.accepted:
+        return error_response(message="Issue is already accepted")
+        
+    issue.assignment_status = IssueAssignmentStatusEnum.accepted
+    issue.status = IssueStatusEnum.in_progress
+    
+    # Notify team members/project members that the user is now working on it
+    from app.models.project import project_members
+    if issue.project_id:
+        stmt = select(User.id).join(project_members, project_members.c.user_id == User.id).filter(project_members.c.project_id == issue.project_id)
+        team_members = (await db.execute(stmt)).scalars().all()
+        for member_id in team_members:
+            if member_id != current_user.id:
+                db.add(Notification(
+                    title="Issue Accepted",
+                    message=f"{current_user.full_name} is now working on '{issue.title}'",
+                    type=NotificationTypeEnum.task_assigned, # Reusing type for now
+                    user_id=member_id,
+                    link=f"/issues?id={issue.id}",
+                ))
+    
+    await db.commit()
+    loaded = await _load_issue(db, issue_id)
+    return success_response(data=_serialize_issue(db, loaded), message="Issue accepted successfully")
+
+
+@router.post("/{issue_id}/decline", response_model=APIResponse)
+async def decline_issue(
+    issue_id: int,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    from app.models.issue import IssueAssignmentStatusEnum
+    from datetime import datetime
+    issue = await _load_issue(db, issue_id)
+    if not issue:
+        return error_response(message="Issue not found")
+    
+    if issue.assigned_user_id != current_user.id:
+        return error_response(message="Only the assigned user can decline this issue")
+        
+    # Add to declined_by_users list
+    declined_list = list(issue.declined_by_users) if issue.declined_by_users else []
+    if current_user.id not in declined_list:
+        declined_list.append(current_user.id)
+    issue.declined_by_users = declined_list
+    
+    # Auto-assign to next person logic
+    next_assignee = None
+    if issue.project_id:
+        from app.models.project import project_members
+        from app.models.user import RoleEnum
+        stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
+            project_members.c.project_id == issue.project_id, 
+            User.is_deleted == False,
+            User.id.notin_(declined_list)
+        )
+        proj_members = [m for m in (await db.execute(stmt)).scalars().all() if m.role != "ceo" and getattr(m.role, "value", m.role) != "ceo"]
+        
+        if proj_members:
+            member_ids = [m.id for m in proj_members]
+            issue_counts = await db.execute(
+                select(Issue.assigned_user_id, func.count(Issue.id))
+                .filter(Issue.assigned_user_id.in_(member_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
+                .group_by(Issue.assigned_user_id)
+            )
+            counts_dict = {row[0]: row[1] for row in issue_counts}
+            proj_members.sort(key=lambda m: counts_dict.get(m.id, 0))
+            next_assignee = proj_members[0]
+            
+    if next_assignee:
+        issue.assigned_user_id = next_assignee.id
+        issue.assignment_status = IssueAssignmentStatusEnum.accepted
+        issue.status = IssueStatusEnum.in_progress
+        
+        db.add(Notification(
+            title="Issue Reassigned to You",
+            message=f"{current_user.full_name or 'Someone'} declined: {issue.title}. You have been automatically assigned to work on it.",
+            type=NotificationTypeEnum.task_assigned,
+            user_id=next_assignee.id,
+            link=f"/issues?id={issue.id}",
+        ))
+        
+        # Notify project team members
+        if issue.project_id:
+            from app.models.project import project_members as proj_mem_table
+            stmt = select(User.id).join(proj_mem_table, proj_mem_table.c.user_id == User.id).filter(proj_mem_table.c.project_id == issue.project_id)
+            team_members = (await db.execute(stmt)).scalars().all()
+            for member_id in team_members:
+                if member_id != current_user.id and member_id != next_assignee.id:
+                    db.add(Notification(
+                        title="Issue Declined and Reassigned",
+                        message=f"{current_user.full_name} declined '{issue.title}'. It was reassigned to {next_assignee.full_name}.",
+                        type=NotificationTypeEnum.project_update,
+                        user_id=member_id,
+                        link=f"/issues?id={issue.id}",
+                    ))
+    else:
+        # No one left to assign
+        issue.assigned_user_id = None
+        issue.assignment_status = None
+        # Could notify admin here
+        
+    await db.commit()
+    loaded = await _load_issue(db, issue_id)
+    return success_response(data=_serialize_issue(db, loaded), message="Issue declined. It has been routed to the next available teammate.")
+
+
+from pydantic import BaseModel
+class IssueTransfer(BaseModel):
+    user_id: int
+    reason: Optional[str] = None
+
+@router.post("/{issue_id}/transfer", response_model=APIResponse)
+async def transfer_issue(
+    issue_id: int,
+    transfer_in: IssueTransfer,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    from app.models.issue import IssueAssignmentStatusEnum
+    from datetime import datetime
+    
+    issue = await _load_issue(db, issue_id)
+    if not issue:
+        return error_response(message="Issue not found")
+        
+    if issue.assigned_user_id != current_user.id and _role(current_user) not in CEO_ROLES:
+        return error_response(message="Only the assignee or admin can transfer this issue")
+        
+    target_user = (await db.execute(select(User).filter(User.id == transfer_in.user_id, User.is_deleted == False))).scalars().first()
+    if not target_user:
+        return error_response(message="Target user not found")
+        
+    issue.assigned_user_id = target_user.id
+    issue.assignment_status = IssueAssignmentStatusEnum.pending_acceptance
+    issue.assignment_timestamp = datetime.utcnow()
+    
+    # Notify target user
+    db.add(Notification(
+        title="Issue Transferred to You",
+        message=f"{current_user.full_name} transferred '{issue.title}' to you.",
+        type=NotificationTypeEnum.task_assigned,
+        user_id=target_user.id,
+        link=f"/issues?id={issue.id}",
+    ))
+    
+    # Notify project team members
+    if issue.project_id:
+        from app.models.project import project_members
+        stmt = select(User.id).join(project_members, project_members.c.user_id == User.id).filter(project_members.c.project_id == issue.project_id)
+        team_members = (await db.execute(stmt)).scalars().all()
+        for member_id in team_members:
+            if member_id != current_user.id and member_id != target_user.id:
+                db.add(Notification(
+                    title="Issue Transferred",
+                    message=f"{current_user.full_name} transferred '{issue.title}' to {target_user.full_name}.",
+                    type=NotificationTypeEnum.project_update,
+                    user_id=member_id,
+                    link=f"/issues?id={issue.id}",
+                ))
+    
+    # Create an internal followup noting the transfer
+    db_followup = IssueFollowup(
+        issue_id=issue.id, 
+        user_id=current_user.id, 
+        message=f"System: Transferred issue to {target_user.full_name}. Reason: {transfer_in.reason or 'None provided'}"
+    )
+    db.add(db_followup)
+    
+    await db.commit()
+    loaded = await _load_issue(db, issue_id)
+    return success_response(data=_serialize_issue(db, loaded), message="Issue transferred successfully")

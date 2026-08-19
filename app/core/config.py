@@ -24,12 +24,14 @@ class Settings(BaseSettings):
     AWS_REGION: str = "us-east-1"
     AWS_S3_BUCKET_NAME: str = ""
     
+    DATABASE_URL: str | None = None
+    
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
         import os
 
         # Priority 1: DATABASE_URL (Render, Heroku, managed databases)
-        database_url = os.getenv("DATABASE_URL", "").strip()
+        database_url = (self.DATABASE_URL or "").strip()
         if database_url:
             if database_url.startswith("postgres://"):
                 database_url = "postgresql+psycopg://" + database_url[len("postgres://"):]

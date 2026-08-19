@@ -179,6 +179,37 @@ async def get_user_schedule(
             "status": t.status.value if t.status else "todo",
             "read_only": False
         })
+        
+    # Fetch Issues for the target user
+    from app.models.issue import Issue, IssueAssignmentStatusEnum
+    issues_query = (
+        select(Issue)
+        .filter(Issue.assigned_user_id == target_user.id)
+        .filter(Issue.assignment_status == IssueAssignmentStatusEnum.accepted)
+        .filter(Issue.is_deleted == False)
+    )
+    if start_date:
+        issues_query = issues_query.filter(Issue.deadline >= start_date)
+    if end_date:
+        issues_query = issues_query.filter(Issue.deadline <= end_date)
+
+    issues_result = await db.execute(issues_query)
+    issues = issues_result.scalars().all()
+
+    for i in issues:
+        issue_date = i.deadline or i.updated_at
+        schedule.append({
+            "id": i.id,
+            "source": "nurofin_issue",
+            "title": f"[Issue] {i.title}",
+            "description": i.description or "",
+            "date": issue_date,
+            "start_time": "10:00", # Default placeholders if no explicit time is set
+            "end_time": "11:00",
+            "type": "issue",
+            "status": i.status.value if hasattr(i.status, "value") else i.status,
+            "read_only": False
+        })
 
     if target_user.google_access_token and target_user.google_refresh_token:
         try:
