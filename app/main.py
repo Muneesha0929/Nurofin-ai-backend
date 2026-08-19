@@ -10,11 +10,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.v1.api import api_router
 from app.db.init_db import init_db
+from app.core.scheduler import process_issue_timeouts
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    task = asyncio.create_task(process_issue_timeouts())
     yield
+    task.cancel()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

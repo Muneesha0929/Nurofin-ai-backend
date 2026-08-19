@@ -45,6 +45,40 @@ async def read_tasks(
     result = await db.execute(stmt.offset(skip).limit(limit))
     tasks = result.scalars().all()
     data = [TaskSchema.from_orm(t).dict() for t in tasks]
+    
+    # Also fetch accepted issues for the Task Center
+    from app.models.issue import Issue, IssueAssignmentStatusEnum
+    issues_stmt = (
+        select(Issue)
+        .options(selectinload(Issue.assigned_user), selectinload(Issue.reported_by))
+        .filter(Issue.is_deleted == False)
+        .filter(Issue.assignment_status == IssueAssignmentStatusEnum.accepted)
+    )
+    # If not a CEO/admin, only show their issues
+    if not (current_user.role and hasattr(current_user.role, "value") and current_user.role.value in ("ceo", "admin", "super_admin")) and current_user.role not in ("ceo", "admin", "super_admin"):
+        issues_stmt = issues_stmt.filter(Issue.assigned_user_id == current_user.id)
+        
+    issues_result = await db.execute(issues_stmt.offset(skip).limit(limit))
+    issues = issues_result.scalars().all()
+    
+    for issue in issues:
+        data.append({
+            "id": issue.id, # Keep as integer to avoid breaking frontend TypeScript
+            "title": f"[Issue] {issue.title}",
+            "description": issue.description,
+            "status": issue.status.value if hasattr(issue.status, "value") else issue.status,
+            "priority": issue.priority.value if hasattr(issue.priority, "value") else issue.priority,
+            "deadline": issue.deadline,
+            "progress": 100.0 if issue.status in ["resolved", "closed"] else 0.0,
+            "source": "issue",
+            "assigned_to_id": issue.assigned_user_id,
+            "assigned_by_id": issue.reported_by_id,
+            "project_id": issue.project_id,
+            "assigned_to": {"id": issue.assigned_user.id, "full_name": issue.assigned_user.full_name, "profile_picture": issue.assigned_user.profile_picture} if issue.assigned_user else None,
+            "assigned_by": {"id": issue.reported_by.id, "full_name": issue.reported_by.full_name, "profile_picture": issue.reported_by.profile_picture} if issue.reported_by else None,
+            "is_issue": True
+        })
+        
     return success_response(data=data, message="Tasks retrieved successfully")
 
 @router.get("/overdue", response_model=APIResponse)
