@@ -301,32 +301,38 @@ async def check_availability(
 
     busy_blocks = []
 
-    for uid in ids:
-        user_result = await db.execute(select(User).filter(User.id == uid))
-        user = user_result.scalars().first()
-        if not user:
-            continue
+    # Batch query local meetings
+    from sqlalchemy.orm import selectinload
+    local_query = (
+        select(Meeting)
+        .options(selectinload(Meeting.participant_entries))
+        .join(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
+        .filter(MeetingParticipant.user_id.in_(ids))
+        .filter(Meeting.is_deleted == False)
+        .filter(Meeting.date == date)
+    )
+    local_result = await db.execute(local_query)
+    local_meetings = local_result.scalars().unique().all()
+    
+    # We need user details for the blocks, fetch all users in batch
+    users_result = await db.execute(select(User).filter(User.id.in_(ids)))
+    users_map = {u.id: u for u in users_result.scalars().all()}
+    
+    # Process local meetings
+    for m in local_meetings:
+        for p in m.participant_entries:
+            if p.user_id in users_map:
+                busy_blocks.append({
+                    "user_id": p.user_id,
+                    "user_name": users_map[p.user_id].full_name,
+                    "source": "nurofin",
+                    "title": m.title,
+                    "start_time": m.start_time,
+                    "end_time": m.end_time,
+                })
 
-        local_query = (
-            select(Meeting)
-            .join(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
-            .filter(MeetingParticipant.user_id == uid)
-            .filter(Meeting.is_deleted == False)
-            .filter(Meeting.date == date)
-        )
-        local_result = await db.execute(local_query)
-        local_meetings = local_result.scalars().all()
-
-        for m in local_meetings:
-            busy_blocks.append({
-                "user_id": uid,
-                "user_name": user.full_name,
-                "source": "nurofin",
-                "title": m.title,
-                "start_time": m.start_time,
-                "end_time": m.end_time,
-            })
-
+    # Process Google Calendar
+    for uid, user in users_map.items():
         if user.google_access_token and user.google_refresh_token:
             try:
                 google_events = fetch_calendar_events(user, time_min, time_max)

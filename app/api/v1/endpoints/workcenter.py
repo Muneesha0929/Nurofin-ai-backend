@@ -18,18 +18,33 @@ from app.core.responses import success_response, error_response
 router = APIRouter()
 
 
-async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True) -> dict:
+async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True, cache: dict = None) -> dict:
+    if cache is None:
+        cache = {'users': {}, 'projects': {}}
+        
+    async def get_user_cached(uid):
+        if not uid: return None
+        if uid not in cache['users']:
+            cache['users'][uid] = (await db.execute(select(User).filter(User.id == uid))).scalars().first()
+        return cache['users'][uid]
+
+    async def get_project_cached(pid):
+        if not pid: return None
+        if pid not in cache['projects']:
+            from app.models.project import Project
+            cache['projects'][pid] = (await db.execute(select(Project).filter(Project.id == pid))).scalars().first()
+        return cache['projects'][pid]
+
     subtasks = []
     if load_subtasks and hasattr(t, "subtasks") and t.subtasks:
         for s in t.subtasks:
-            subtasks.append(await _serialize_task(db, s, load_subtasks=False))
-    assignee = (await db.execute(select(User).filter(User.id == t.assigned_to_id))).scalars().first() if t.assigned_to_id else None
-    assigner = (await db.execute(select(User).filter(User.id == t.assigned_by_id))).scalars().first() if t.assigned_by_id else None
-    reviewer = (await db.execute(select(User).filter(User.id == t.reviewer_id))).scalars().first() if t.reviewer_id else None
-    project = None
-    if t.project_id:
-        from app.models.project import Project
-        project = (await db.execute(select(Project).filter(Project.id == t.project_id))).scalars().first()
+            subtasks.append(await _serialize_task(db, s, load_subtasks=False, cache=cache))
+            
+    assignee = await get_user_cached(t.assigned_to_id)
+    assigner = await get_user_cached(t.assigned_by_id)
+    reviewer = await get_user_cached(t.reviewer_id)
+    project = await get_project_cached(t.project_id)
+    
     # Fetch latest transfer history
     transfer_date = None
     transfer_to_name = None
@@ -46,7 +61,7 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True)
             transfer_date = latest_assigned_history.created_at.strftime("%Y-%m-%d") if latest_assigned_history.created_at else None
             if latest_assigned_history.new_value and latest_assigned_history.new_value != "None" and latest_assigned_history.new_value.isdigit():
                 new_assignee_id = int(latest_assigned_history.new_value)
-                t_user = (await db.execute(select(User).filter(User.id == new_assignee_id))).scalars().first()
+                t_user = await get_user_cached(new_assignee_id)
                 if t_user:
                     transfer_to_name = t_user.full_name
     except Exception:
@@ -230,9 +245,10 @@ async def read_tasks(
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(q.order_by(Task.created_at.desc()).offset((page - 1) * page_size).limit(page_size))
     tasks = result.scalars().all()
+    cache = {'users': {}, 'projects': {}}
     data = []
     for t in tasks:
-        data.append(await _serialize_task(db, t))
+        data.append(await _serialize_task(db, t, cache=cache))
     return success_response(data={"tasks": data, "total": total, "page": page, "page_size": page_size})
 
 
@@ -723,7 +739,8 @@ async def get_performance(
     pct = round((completed / total) * 100, 1) if total > 0 else 0.0
 
     tasks_r = await db.execute(select(Task).options(selectinload(Task.subtasks)).where(*base).order_by(Task.created_at.desc()).limit(50))
-    tasks = [await _serialize_task(db, t) for t in tasks_r.scalars().all()]
+    cache = {'users': {}, 'projects': {}}
+    tasks = [await _serialize_task(db, t, cache=cache) for t in tasks_r.scalars().all()]
 
     return success_response(data={
         "user": {"id": user.id, "name": user.full_name, "avatar": user.profile_picture, "department": user.department, "role": user.role if user.role else None},

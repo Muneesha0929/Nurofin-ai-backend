@@ -403,24 +403,26 @@ async def create_meeting(
             time_min = datetime.fromisoformat(meeting_in.date + "T00:00:00+00:00")
             time_max = datetime.fromisoformat(meeting_in.date + "T23:59:59+00:00")
             
-            for uid in all_ids:
-                # fetch Nurofin local
-                local_query = (
-                    select(Meeting)
-                    .outerjoin(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
-                    .filter((Meeting.owner_id == uid) | (MeetingParticipant.user_id == uid))
-                    .filter(Meeting.is_deleted == False)
-                    .filter(Meeting.date == meeting_in.date)
-                )
-                local_result = await db.execute(local_query)
-                local_meetings = local_result.scalars().all()
-                for m in local_meetings:
-                    busy_blocks.append({"start_time": m.start_time, "end_time": m.end_time})
+            # Fetch all local meetings for all users in one query
+            local_query = (
+                select(Meeting)
+                .outerjoin(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
+                .filter((Meeting.owner_id.in_(all_ids)) | (MeetingParticipant.user_id.in_(all_ids)))
+                .filter(Meeting.is_deleted == False)
+                .filter(Meeting.date == meeting_in.date)
+            )
+            local_result = await db.execute(local_query)
+            local_meetings = local_result.scalars().unique().all()
+            for m in local_meetings:
+                busy_blocks.append({"start_time": m.start_time, "end_time": m.end_time})
                 
-                # fetch Google Calendar
-                user_result = await db.execute(select(User).filter(User.id == uid))
-                u = user_result.scalars().first()
-                if u and u.google_access_token and u.google_refresh_token:
+            # Fetch all users in one query for Google Calendar checks
+            users_query = select(User).filter(User.id.in_(all_ids))
+            users_result = await db.execute(users_query)
+            all_users = users_result.scalars().all()
+            
+            for u in all_users:
+                if u.google_access_token and u.google_refresh_token:
                     try:
                         g_events = fetch_calendar_events(u, time_min, time_max)
                         for item in g_events:
