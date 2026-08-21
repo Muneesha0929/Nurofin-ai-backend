@@ -151,6 +151,8 @@ async def get_user_schedule(
             "location": m.location or None,
         })
 
+    from sqlalchemy import or_
+
     # Fetch Tasks for the target user
     tasks_query = (
         select(Task)
@@ -158,9 +160,13 @@ async def get_user_schedule(
         .filter(Task.status != "completed")
     )
     if start_date:
-        tasks_query = tasks_query.filter(Task.deadline >= start_date)
+        tasks_query = tasks_query.filter(
+            or_(Task.deadline >= start_date, Task.scheduled_date >= start_date)
+        )
     if end_date:
-        tasks_query = tasks_query.filter(Task.deadline <= end_date)
+        tasks_query = tasks_query.filter(
+            or_(Task.deadline <= end_date, Task.scheduled_date <= end_date)
+        )
 
     tasks_result = await db.execute(tasks_query)
     tasks = tasks_result.scalars().all()

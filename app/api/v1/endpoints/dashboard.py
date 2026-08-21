@@ -38,12 +38,26 @@ async def get_dashboard_summary(
     res = await db.execute(select(func.count(Task.id)).filter(Task.status == 'completed', Task.is_deleted == False))
     completed_tasks = res.scalar() or 0
 
+    from sqlalchemy import or_
     # Today's Tasks
-    res = await db.execute(select(func.count(Task.id)).filter(Task.deadline == today_str, Task.is_deleted == False))
+    res = await db.execute(
+        select(func.count(Task.id))
+        .filter(or_(Task.deadline == today_str, Task.scheduled_date == today_str), Task.is_deleted == False)
+    )
     today_tasks = res.scalar() or 0
 
     # Overdue Tasks
-    res = await db.execute(select(func.count(Task.id)).filter(Task.deadline < today_str, Task.status != 'completed', Task.is_deleted == False))
+    res = await db.execute(
+        select(func.count(Task.id))
+        .filter(
+            or_(
+                Task.deadline < today_str,
+                Task.scheduled_date < today_str
+            ),
+            Task.status != 'completed',
+            Task.is_deleted == False
+        )
+    )
     overdue_tasks = res.scalar() or 0
 
     # Today's Meetings
@@ -89,11 +103,14 @@ async def get_dashboard_summary(
 
     # Upcoming deadlines (next 7 days)
     end_date = datetime.now() + __import__('datetime').timedelta(days=7)
+    end_date_str = end_date.strftime('%Y-%m-%d')
     upcoming_deadlines = await db.execute(
         select(func.count(Task.id))
         .filter(
-            Task.deadline >= today_str,
-            Task.deadline <= end_date.strftime('%Y-%m-%d'),
+            or_(
+                Task.deadline.between(today_str, end_date_str),
+                Task.scheduled_date.between(today_str, end_date_str)
+            ),
             Task.status != 'completed',
             Task.is_deleted == False,
         )

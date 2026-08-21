@@ -40,6 +40,7 @@ async def read_tasks(
         select(Task)
         .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by))
         .filter(Task.is_deleted == False)
+        .order_by(Task.id.desc())
     )
 
     result = await db.execute(stmt.offset(skip).limit(limit))
@@ -89,13 +90,20 @@ async def read_overdue_tasks(
     current_user: User = Depends(deps.get_current_user)
 ) -> Any:
     from datetime import datetime
+    from sqlalchemy import or_
     today_str = datetime.now().strftime('%Y-%m-%d')
     stmt = (
         select(Task)
         .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by))
         .filter(Task.is_deleted == False)
         .filter(Task.status != TaskStatusEnum.completed)
-        .filter(Task.deadline < today_str)
+        .filter(
+            or_(
+                Task.deadline < today_str,
+                Task.scheduled_date < today_str
+            )
+        )
+        .order_by(Task.id.desc())
     )
 
     result = await db.execute(stmt.offset(skip).limit(limit))
