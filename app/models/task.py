@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Float, Text
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Float, Text, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from app.db.base_class import Base
@@ -33,6 +33,8 @@ class Task(Base):
     estimated_hours = Column(Float, nullable=True)
     progress = Column(Float, default=0.0)
     source = Column(String)
+    extended_time = Column(Float, nullable=True)
+    pushed_to_next_day = Column(Boolean, default=False)
 
     assigned_to_id = Column(Integer, ForeignKey("user.id"), nullable=True)
     assigned_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)

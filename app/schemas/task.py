@@ -20,6 +20,8 @@ class TaskBase(BaseModel):
     scheduled_date: Optional[Union[datetime, str]] = None
     scheduled_start_time: Optional[str] = None
     scheduled_end_time: Optional[str] = None
+    extended_time: Optional[float] = None
+    pushed_to_next_day: Optional[bool] = False
 
 class TaskCreate(TaskBase):
     title: str

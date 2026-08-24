@@ -45,6 +45,25 @@ async def read_tasks(
 
     result = await db.execute(stmt.offset(skip).limit(limit))
     tasks = result.scalars().all()
+    
+    from datetime import datetime, timedelta
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    pushed_any = False
+    for t in tasks:
+        if t.assigned_to_id == current_user.id and str(t.status).split('.')[-1] not in ["completed", "done"]:
+            date_to_check = t.scheduled_date
+            if not date_to_check and t.deadline:
+                date_to_check = t.deadline.split('T')[0] if isinstance(t.deadline, str) else t.deadline.strftime('%Y-%m-%d')
+            if date_to_check and date_to_check < today_str:
+                d = datetime.now()
+                if d.weekday() == 6:
+                    d += timedelta(days=1)
+                t.scheduled_date = d.strftime('%Y-%m-%d')
+                t.pushed_to_next_day = True
+                pushed_any = True
+    if pushed_any:
+        await db.commit()
+        
     data = [TaskSchema.from_orm(t).dict() for t in tasks]
     
     # Also fetch accepted issues for the Task Center
@@ -253,6 +272,46 @@ async def update_task(
             ))
         except Exception:
             pass
+
+    if str(update_data.get("status")).split('.')[-1] in ["completed", "done"] and update_data.get("extended_time"):
+        extended_hours = float(update_data["extended_time"])
+        if extended_hours > 0 and task.scheduled_date and task.scheduled_start_time:
+            try:
+                subsequent_res = await db.execute(
+                    select(Task).filter(
+                        Task.assigned_to_id == task.assigned_to_id,
+                        Task.scheduled_date == task.scheduled_date,
+                        Task.scheduled_start_time > task.scheduled_start_time,
+                        Task.is_deleted == False,
+                        Task.id != task.id,
+                        Task.status != 'completed'
+                    ).order_by(Task.scheduled_start_time)
+                )
+                subsequent_tasks = subsequent_res.scalars().all()
+                for st_task in subsequent_tasks:
+                    if st_task.scheduled_start_time:
+                        parts = st_task.scheduled_start_time.split(':')
+                        h, m = int(parts[0]), int(parts[1])
+                        new_h = h + int(extended_hours)
+                        if new_h >= 24:
+                            new_h -= 24
+                            from datetime import datetime, timedelta
+                            d = datetime.strptime(st_task.scheduled_date, "%Y-%m-%d")
+                            d += timedelta(days=1)
+                            if d.weekday() == 6:
+                                d += timedelta(days=1)
+                            st_task.scheduled_date = d.strftime("%Y-%m-%d")
+                            st_task.pushed_to_next_day = True
+                        st_task.scheduled_start_time = f"{new_h:02d}:{m:02d}"
+                    if st_task.scheduled_end_time:
+                        parts = st_task.scheduled_end_time.split(':')
+                        h, m = int(parts[0]), int(parts[1])
+                        new_h = h + int(extended_hours)
+                        if new_h >= 24:
+                            new_h -= 24
+                        st_task.scheduled_end_time = f"{new_h:02d}:{m:02d}"
+            except Exception as e:
+                print("Error cascading task", e)
 
     await db.commit()
 
