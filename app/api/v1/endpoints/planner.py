@@ -157,7 +157,7 @@ async def get_user_schedule(
     tasks_query = (
         select(Task)
         .filter(Task.assigned_to_id == target_user.id)
-        .filter(Task.status != "completed")
+        .filter(Task.is_deleted == False)
     )
     if start_date:
         tasks_query = tasks_query.filter(
@@ -183,7 +183,10 @@ async def get_user_schedule(
             "end_time": t.scheduled_end_time or "10:00",
             "type": "task",
             "status": t.status.value if hasattr(t.status, "value") else t.status,
-            "read_only": False
+            "read_only": False,
+            "actual_completion_date": t.actual_completion_date,
+            "extended_time": t.extended_time,
+            "pushed_to_next_day": getattr(t, "pushed_to_next_day", False)
         })
         
     # Fetch Issues for the target user
@@ -204,6 +207,9 @@ async def get_user_schedule(
 
     for i in issues:
         issue_date = i.deadline or i.updated_at
+        raw_status = i.status.value if hasattr(i.status, "value") else i.status
+        mapped_status = "completed" if raw_status in ["resolved", "closed"] else raw_status
+        
         schedule.append({
             "id": i.id,
             "source": "nurofin_issue",
@@ -213,8 +219,9 @@ async def get_user_schedule(
             "start_time": "10:00", # Default placeholders if no explicit time is set
             "end_time": "11:00",
             "type": "issue",
-            "status": i.status.value if hasattr(i.status, "value") else i.status,
-            "read_only": False
+            "status": mapped_status,
+            "read_only": False,
+            "actual_completion_date": i.updated_at.isoformat()[:10] if i.updated_at and mapped_status == "completed" else None,
         })
 
     if target_user.google_access_token and target_user.google_refresh_token:
