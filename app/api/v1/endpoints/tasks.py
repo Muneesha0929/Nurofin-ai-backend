@@ -5,7 +5,7 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 
 from app.api import deps
-from app.models.task import Task
+from app.models.task import Task, TaskStatusEnum
 from app.models.user import User
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.task import TaskCreate, TaskUpdate, Task as TaskSchema
@@ -82,21 +82,29 @@ async def read_tasks(
     issues = issues_result.scalars().all()
     
     for issue in issues:
+        mapped_status = "open"
+        if issue.status:
+            if issue.status in ["resolved", "closed"] or getattr(issue.status, "value", None) in ["resolved", "closed"]:
+                mapped_status = "completed"
+            else:
+                mapped_status = issue.status.value if hasattr(issue.status, "value") else issue.status
+
         data.append({
-            "id": issue.id, # Keep as integer to avoid breaking frontend TypeScript
+            "id": issue.id,
             "title": f"[Issue] {issue.title}",
             "description": issue.description,
-            "status": issue.status.value if hasattr(issue.status, "value") else issue.status,
+            "status": mapped_status,
             "priority": issue.priority.value if hasattr(issue.priority, "value") else issue.priority,
             "deadline": issue.deadline,
-            "progress": 100.0 if issue.status in ["resolved", "closed"] else 0.0,
+            "progress": 100.0 if mapped_status == "completed" else 0.0,
             "source": "issue",
             "assigned_to_id": issue.assigned_user_id,
             "assigned_by_id": issue.reported_by_id,
             "project_id": issue.project_id,
             "assigned_to": {"id": issue.assigned_user.id, "full_name": issue.assigned_user.full_name, "profile_picture": issue.assigned_user.profile_picture} if issue.assigned_user else None,
             "assigned_by": {"id": issue.reported_by.id, "full_name": issue.reported_by.full_name, "profile_picture": issue.reported_by.profile_picture} if issue.reported_by else None,
-            "is_issue": True
+            "is_issue": True,
+            "actual_completion_date": issue.updated_at.strftime('%Y-%m-%d') if mapped_status == "completed" and issue.updated_at else None
         })
         
     return success_response(data=data, message="Tasks retrieved successfully")
@@ -159,6 +167,17 @@ async def create_task(
 ) -> Any:
     try:
         task_data = task_in.dict(exclude_unset=True)
+        
+        idempotency_key = task_data.get("idempotency_key")
+        if idempotency_key:
+            existing_task_res = await db.execute(select(Task).filter(Task.idempotency_key == idempotency_key))
+            existing_task = existing_task_res.scalars().first()
+            if existing_task:
+                return APIResponse(
+                    status="success",
+                    message="Task created successfully (idempotency)",
+                    data=existing_task
+                )
         
         # Determine quarter_id from deadline or scheduled_date
         date_str = task_data.get("deadline") or task_data.get("scheduled_date")
@@ -234,9 +253,30 @@ async def update_task(
     old_project_id = task.project_id
     old_assigned_to_id = task.assigned_to_id
     update_data = task_in.dict(exclude_unset=True)
+    
+    # Ensure actual_completion_date is a datetime object
+    if "actual_completion_date" in update_data and isinstance(update_data["actual_completion_date"], str):
+        try:
+            from datetime import datetime
+            # Handle both "YYYY-MM-DD" and ISO format strings
+            date_str = update_data["actual_completion_date"]
+            if 'T' in date_str:
+                update_data["actual_completion_date"] = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            else:
+                update_data["actual_completion_date"] = datetime.strptime(date_str, '%Y-%m-%d')
+        except ValueError:
+            pass # fallback to string, let sqlalchemy handle or fail
+
     for field, value in update_data.items():
         setattr(task, field, value)
         
+    if update_data.get("status") in [TaskStatusEnum.completed, "completed", "done"]:
+        if not task.actual_completion_date:
+            from datetime import datetime
+            task.actual_completion_date = datetime.utcnow()
+    elif update_data.get("status") and update_data.get("status") not in [TaskStatusEnum.completed, "completed", "done"]:
+        task.actual_completion_date = None
+
     # Determine quarter_id from updated deadline or scheduled_date
     date_str = update_data.get("deadline") or update_data.get("scheduled_date")
     if date_str:

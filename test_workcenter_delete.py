@@ -1,17 +1,17 @@
 import asyncio
-from sqlalchemy.future import select
 from app.db.session import SessionLocal
+from app.api.v1.endpoints.workcenter import delete_task
 from app.models.user import User
-from app.api.v1.endpoints.tasks import read_tasks
 
 async def run():
     async with SessionLocal() as db:
-        user = (await db.execute(select(User).limit(1))).scalars().first()
+        user = User(id=1)
+        # Try to delete task 45
         try:
-            res = await read_tasks(db=db, current_user=user)
-            print("Success, tasks fetched:", len(res.data))
+            res = await delete_task(db=db, task_id=45, current_user=user)
+            print("Response:", res)
         except Exception as e:
-            print("ERROR FETCHING TASKS:", e)
+            print("Error:", e)
 
 if __name__ == "__main__":
     import sys

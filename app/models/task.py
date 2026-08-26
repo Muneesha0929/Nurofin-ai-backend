@@ -35,6 +35,8 @@ class Task(Base):
     source = Column(String)
     extended_time = Column(Float, nullable=True)
     pushed_to_next_day = Column(Boolean, default=False)
+    actual_completion_date = Column(String, nullable=True)
+    idempotency_key = Column(String, unique=True, index=True, nullable=True)
 
     assigned_to_id = Column(Integer, ForeignKey("user.id"), nullable=True)
     assigned_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
@@ -48,6 +50,7 @@ class Task(Base):
     assigned_to = relationship("User", foreign_keys=[assigned_to_id], back_populates="assigned_tasks")
     assigned_by = relationship("User", foreign_keys=[assigned_by_id], back_populates="created_tasks")
     reviewer = relationship("User", foreign_keys=[reviewer_id])
-    parent = relationship("Task", remote_side=[id], backref="subtasks")
+    parent = relationship("Task", remote_side=[id], back_populates="subtasks")
+    subtasks = relationship("Task", back_populates="parent", primaryjoin="and_(Task.id==remote(Task.parent_id), Task.is_deleted==False)")
     project = relationship("Project", back_populates="tasks")
     meeting = relationship("Meeting")

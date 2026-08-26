@@ -61,6 +61,8 @@ def _serialize_project(p: Project) -> dict:
                 "status": t.status.value if hasattr(t.status, 'value') else t.status,
                 "priority": t.priority.value if hasattr(t.priority, 'value') else t.priority,
                 "deadline": _fmt_date(t.deadline),
+                "actual_completion_date": _fmt_date(t.actual_completion_date),
+                "extended_time": t.extended_time,
                 "progress": t.progress,
                 "assigned_to_id": t.assigned_to_id,
                 "assigned_to": {

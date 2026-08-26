@@ -40,6 +40,6 @@ class Project(Base):
     owner_id = Column(Integer, ForeignKey("user.id"))
     owner = relationship("User", back_populates="owned_projects")
     members = relationship("User", secondary=project_members, backref="projects")
-    tasks = relationship("Task", back_populates="project")
+    tasks = relationship("Task", back_populates="project", primaryjoin="and_(Project.id==Task.project_id, Task.is_deleted==False)")
     issues = relationship("Issue", back_populates="project")
     knowledge_docs = relationship("Knowledge", back_populates="project")

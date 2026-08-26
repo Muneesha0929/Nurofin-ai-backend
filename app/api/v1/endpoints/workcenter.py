@@ -87,6 +87,8 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "created_at": t.created_at.isoformat() if t.created_at else None,
         "transfer_date": transfer_date,
         "transfer_to_name": transfer_to_name,
+        "actual_completion_date": t.actual_completion_date,
+        "extended_time": t.extended_time,
     }
 
 
@@ -432,6 +434,7 @@ async def update_task(
     estimated_hours: float = None, assigned_to_id: int = None,
     reviewer_id: int = None, progress: float = None,
     project_id: int = None, quarter_id: int = None,
+    actual_completion_date: str = None, extended_time: float = None,
 ) -> Any:
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id, Task.is_deleted == False))
     task = r.scalars().first()
@@ -454,6 +457,10 @@ async def update_task(
         old_dl = task.deadline
         task.deadline = deadline if deadline != "" else None
         await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+    if actual_completion_date is not None:
+        task.actual_completion_date = actual_completion_date if actual_completion_date != "" else None
+    if extended_time is not None:
+        task.extended_time = extended_time
         # Propagate deadline to subtasks
         await db.execute(
             update(Task)

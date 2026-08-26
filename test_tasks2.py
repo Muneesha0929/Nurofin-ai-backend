@@ -7,11 +7,10 @@ from app.api.v1.endpoints.tasks import read_tasks
 async def run():
     async with SessionLocal() as db:
         user = (await db.execute(select(User).limit(1))).scalars().first()
-        try:
-            res = await read_tasks(db=db, current_user=user)
-            print("Success, tasks fetched:", len(res.data))
-        except Exception as e:
-            print("ERROR FETCHING TASKS:", e)
+        res = await read_tasks(db=db, current_user=user)
+        for t in res.data:
+            if "Infrastreuture" in t['title'] or "Update Planner" in t['title']:
+                print("Found:", t['title'], t['status'], t.get('scheduled_date'), t.get('deadline'))
 
 if __name__ == "__main__":
     import sys

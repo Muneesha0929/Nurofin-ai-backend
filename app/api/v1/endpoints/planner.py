@@ -144,8 +144,8 @@ async def get_user_schedule(
             "date": m.date,
             "start_time": m.start_time,
             "end_time": m.end_time,
-            "type": m.type.value if m.type else "meeting",
-            "status": m.status.value if m.status else "scheduled",
+            "type": m.type.value if hasattr(m.type, "value") else (m.type or "meeting"),
+            "status": m.status.value if hasattr(m.status, "value") else (m.status or "scheduled"),
             "read_only": True,
             "hangout_link": m.meeting_link or None,
             "location": m.location or None,
@@ -182,7 +182,7 @@ async def get_user_schedule(
             "start_time": t.scheduled_start_time or "09:00",
             "end_time": t.scheduled_end_time or "10:00",
             "type": "task",
-            "status": t.status.value if t.status else "todo",
+            "status": t.status.value if hasattr(t.status, "value") else t.status,
             "read_only": False
         })
         
