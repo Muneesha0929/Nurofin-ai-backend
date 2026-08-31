@@ -35,6 +35,8 @@ class Issue(Base):
     status = Column(Enum(IssueStatusEnum), default=IssueStatusEnum.open)
     attachments = Column(JSON, default=[]) # Storing list of URLs
     deadline = Column(String, nullable=True)
+    scheduled_date = Column(String, nullable=True)
+    actual_completion_date = Column(String, nullable=True)
     
     # Auto-assignment & timeouts
     assignment_status = Column(Enum(IssueAssignmentStatusEnum), nullable=True)

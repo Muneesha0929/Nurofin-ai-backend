@@ -17,7 +17,7 @@ class IssueFollowup(IssueFollowupBase):
     created_at: Optional[str] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 class IssueBase(BaseModel):
@@ -30,6 +30,8 @@ class IssueBase(BaseModel):
     project_id: Optional[int] = None
     assigned_user_id: Optional[int] = None
     deadline: Optional[str] = None
+    scheduled_date: Optional[str] = None
+    actual_completion_date: Optional[str] = None
 
 class IssueCreate(IssueBase):
     title: str
@@ -41,7 +43,7 @@ class IssueInDBBase(IssueBase):
     id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 class Issue(IssueInDBBase):

@@ -12,6 +12,7 @@ class TaskBase(BaseModel):
     deadline: Optional[Union[datetime, str]] = None
     progress: Optional[float] = 0.0
     source: Optional[str] = None
+    parent_id: Optional[int] = None
     assigned_to_id: Optional[int] = None
     assigned_by_id: Optional[int] = None
     project_id: Optional[int] = None
@@ -35,7 +36,7 @@ class TaskInDBBase(TaskBase):
     id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 class Task(TaskInDBBase):
@@ -43,5 +44,5 @@ class Task(TaskInDBBase):
     assigned_by: Optional[UserBasic] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True

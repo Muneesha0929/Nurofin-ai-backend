@@ -49,7 +49,7 @@ class MeetingParticipantOut(BaseModel):
     status: ParticipantStatusEnum = ParticipantStatusEnum.pending
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -71,7 +71,7 @@ class MeetingTimelineOut(BaseModel):
     created_at: Optional[datetime] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -89,7 +89,7 @@ class MeetingExtractedTaskOut(BaseModel):
     real_task_id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -122,7 +122,7 @@ class MeetingInDBBase(MeetingBase):
     id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -158,5 +158,5 @@ class Meeting(MeetingInDBBase):
     mom_questions: Optional[List] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True

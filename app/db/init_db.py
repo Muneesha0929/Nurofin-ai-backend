@@ -125,6 +125,8 @@ async def ensure_columns(db) -> None:
             "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS salary FLOAT",
             "ALTER TABLE \"user\" ADD COLUMN IF NOT EXISTS performance_score FLOAT",
             "ALTER TABLE notification ADD COLUMN IF NOT EXISTS link VARCHAR",
+            "ALTER TABLE issue ADD COLUMN IF NOT EXISTS scheduled_date VARCHAR",
+            "ALTER TABLE issue ADD COLUMN IF NOT EXISTS actual_completion_date VARCHAR",
         ]
         for stmt in stmts:
             await db.execute(text(stmt))

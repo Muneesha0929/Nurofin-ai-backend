@@ -22,7 +22,7 @@ class KnowledgeInDBBase(KnowledgeBase):
     id: Optional[int] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -47,7 +47,7 @@ class KnowledgeChunkOut(BaseModel):
     created_at: Optional[str] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 

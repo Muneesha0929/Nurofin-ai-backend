@@ -18,7 +18,7 @@ class ConversationMessageRead(ConversationMessageBase):
     created_at: Optional[str] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -42,7 +42,7 @@ class ConversationRead(ConversationBase):
     messages: List[ConversationMessageRead] = []
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 
@@ -55,5 +55,5 @@ class ConversationListRead(BaseModel):
     message_count: int = 0
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True

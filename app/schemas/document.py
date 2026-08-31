@@ -28,7 +28,7 @@ class DocumentInDBBase(DocumentBase):
     uploaded_by_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True
 
 class Document(DocumentInDBBase):
@@ -48,5 +48,5 @@ class DocumentUserAccess(DocumentUserAccessBase):
     document_id: int
 
     class Config:
-        orm_mode = True
+        from_attributes = True
         from_attributes = True

@@ -1,5 +1,5 @@
 try:
-    from pydantic_settings import BaseSettings
+    from pydantic_settings import BaseSettings, SettingsConfigDict
 except ImportError:
     from pydantic import BaseSettings
 
@@ -29,9 +29,13 @@ class Settings(BaseSettings):
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:
         import os
+        from dotenv import dotenv_values
 
         # Priority 1: DATABASE_URL (Render, Heroku, managed databases)
-        database_url = (self.DATABASE_URL or "").strip()
+        # Force read from .env file to override any lingering system environment variables
+        env_dict = dotenv_values(".env")
+        database_url = (env_dict.get("DATABASE_URL") or self.DATABASE_URL or "").strip()
+        
         if database_url:
             if database_url.startswith("postgres://"):
                 database_url = "postgresql+psycopg://" + database_url[len("postgres://"):]
@@ -54,10 +58,13 @@ class Settings(BaseSettings):
             "or POSTGRES_SERVER/POSTGRES_PORT/POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB."
         )
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-        extra = "ignore"
+    try:
+        model_config = SettingsConfigDict(env_file=".env", case_sensitive=True, extra="ignore")
+    except NameError:
+        class Config:
+            env_file = ".env"
+            case_sensitive = True
+            extra = "ignore"
 
 settings = Settings()
 

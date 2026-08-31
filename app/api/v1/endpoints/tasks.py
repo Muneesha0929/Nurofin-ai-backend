@@ -104,7 +104,8 @@ async def read_tasks(
             "assigned_to": {"id": issue.assigned_user.id, "full_name": issue.assigned_user.full_name, "profile_picture": issue.assigned_user.profile_picture} if issue.assigned_user else None,
             "assigned_by": {"id": issue.reported_by.id, "full_name": issue.reported_by.full_name, "profile_picture": issue.reported_by.profile_picture} if issue.reported_by else None,
             "is_issue": True,
-            "actual_completion_date": issue.updated_at.strftime('%Y-%m-%d') if mapped_status == "completed" and issue.updated_at else None
+            "scheduled_date": getattr(issue, "scheduled_date", None),
+            "actual_completion_date": getattr(issue, "actual_completion_date", None) or (issue.updated_at.strftime('%Y-%m-%d') if mapped_status == "completed" and issue.updated_at else None)
         })
         
     return success_response(data=data, message="Tasks retrieved successfully")
