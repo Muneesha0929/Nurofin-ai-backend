@@ -34,3 +34,5 @@ api_router.include_router(stream.router, prefix="/stream", tags=["stream"])
 api_router.include_router(documents.router, prefix="/documents", tags=["documents"])
 api_router.include_router(issues.router, prefix="/issues", tags=["issues"])
 api_router.include_router(finance.router, prefix="/finance", tags=["finance"])
+from app.api.v1.endpoints import targets
+api_router.include_router(targets.router, prefix="/targets", tags=["targets"])

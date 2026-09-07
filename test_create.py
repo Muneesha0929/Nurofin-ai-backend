@@ -1,21 +1,27 @@
-import asyncio
-from sqlalchemy import text
-from app.db.session import engine
+import urllib.request
+import urllib.parse
+import json
 
-async def main():
-    async with engine.begin() as conn:
-        try:
-            # Try to insert a user with an invalid role
-            await conn.execute(text("""
-                INSERT INTO "user" (email, hashed_password, role, is_active)
-                VALUES ('test_enum@example.com', 'pwd', 'CustomRole', true)
-            """))
-            print("Success")
-        except Exception as e:
-            print("Error:", str(e))
+data = urllib.parse.urlencode({'username': 'vincent@nurofin.com', 'password': 'password'}).encode()
+req = urllib.request.Request('http://127.0.0.1:8000/api/v1/auth/login', data=data)
+try:
+    resp = urllib.request.urlopen(req)
+    token = json.loads(resp.read())['data']['access_token']
+except Exception as e:
+    token = None
 
-if __name__ == "__main__":
-    import sys
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+if token:
+    target_data = json.dumps({
+        "title": "Global Target",
+        "month": "2023-10",
+        "is_global": True,
+        "user_id": 2
+    }).encode()
+    req = urllib.request.Request('http://127.0.0.1:8000/api/v1/targets/', data=target_data, headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'})
+    try:
+        resp = urllib.request.urlopen(req)
+        print("Success:", resp.getcode())
+    except urllib.error.HTTPError as e:
+        print("Error HTTP:", e.code, e.read().decode())
+else:
+    print("No token")
