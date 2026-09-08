@@ -261,17 +261,37 @@ async def get_user_schedule(
                 })
         except Exception as e:
             print(f"Failed to fetch Google Calendar for user {target_user_id}: {e}")
-            schedule.append({
-                "source": "google_error",
-                "title": "Google Calendar sync failed",
-                "description": f"Could not load Google events: {e}",
-                "start": None,
-                "end": None,
-                "type": "google_error",
-                "status": "error",
-                "read_only": True,
-                "error": str(e),
-            })
+            # Auto-disconnect if it's an auth error
+            err_str = str(e).lower()
+            is_auth_error = "invalid_grant" in err_str or "token has been expired or revoked" in err_str or "refresh_token" in err_str or "refresherror" in err_str
+            
+            if is_auth_error:
+                target_user.google_access_token = None
+                target_user.google_refresh_token = None
+                target_user.google_token_expires_at = None
+                schedule.append({
+                    "source": "google_error",
+                    "title": "Google Calendar disconnected",
+                    "description": "Your Google Calendar connection expired or was revoked. Please reconnect.",
+                    "start": None,
+                    "end": None,
+                    "type": "google_error",
+                    "status": "error",
+                    "read_only": True,
+                    "error": str(e),
+                })
+            else:
+                schedule.append({
+                    "source": "google_error",
+                    "title": "Google Calendar sync failed",
+                    "description": f"Could not load Google events: {e}",
+                    "start": None,
+                    "end": None,
+                    "type": "google_error",
+                    "status": "error",
+                    "read_only": True,
+                    "error": str(e),
+                })
         finally:
             await db.commit()
 
@@ -360,8 +380,13 @@ async def check_availability(
                         "start": start_dt,
                         "end": end_dt,
                     })
-            except Exception:
-                pass
+            except Exception as e:
+                err_str = str(e).lower()
+                is_auth_error = "invalid_grant" in err_str or "token has been expired or revoked" in err_str or "refresh_token" in err_str or "refresherror" in err_str
+                if is_auth_error:
+                    user.google_access_token = None
+                    user.google_refresh_token = None
+                    user.google_token_expires_at = None
 
     return success_response(
         data={"date": date, "busy_blocks": busy_blocks},
