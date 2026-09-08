@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey, JSON, DateTime
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey, JSON, DateTime, Float, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -36,6 +36,10 @@ class Issue(Base):
     attachments = Column(JSON, default=[]) # Storing list of URLs
     deadline = Column(String, nullable=True)
     scheduled_date = Column(String, nullable=True)
+    scheduled_start_time = Column(String, nullable=True)
+    scheduled_end_time = Column(String, nullable=True)
+    extended_time = Column(Float, nullable=True)
+    pushed_to_next_day = Column(Boolean, nullable=True, default=False)
     actual_completion_date = Column(String, nullable=True)
     
     # Auto-assignment & timeouts

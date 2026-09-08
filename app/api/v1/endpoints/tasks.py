@@ -38,7 +38,7 @@ async def read_tasks(
 ) -> Any:
     stmt = (
         select(Task)
-        .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by))
+        .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by), selectinload(Task.subtasks))
         .filter(Task.is_deleted == False)
         .order_by(Task.id.desc())
     )
@@ -64,7 +64,14 @@ async def read_tasks(
     if pushed_any:
         await db.commit()
         
-    data = [TaskSchema.from_orm(t).dict() for t in tasks]
+    data = []
+    for t in tasks:
+        d = TaskSchema.from_orm(t).dict()
+        try:
+            d["has_subtasks"] = len([s for s in t.subtasks if not s.is_deleted]) > 0
+        except Exception:
+            d["has_subtasks"] = False
+        data.append(d)
     
     # Also fetch accepted issues for the Task Center
     from app.models.issue import Issue, IssueAssignmentStatusEnum
@@ -104,7 +111,12 @@ async def read_tasks(
             "assigned_to": {"id": issue.assigned_user.id, "full_name": issue.assigned_user.full_name, "profile_picture": issue.assigned_user.profile_picture} if issue.assigned_user else None,
             "assigned_by": {"id": issue.reported_by.id, "full_name": issue.reported_by.full_name, "profile_picture": issue.reported_by.profile_picture} if issue.reported_by else None,
             "is_issue": True,
-            "scheduled_date": getattr(issue, "scheduled_date", None),
+            "has_subtasks": False,
+            "scheduled_date": issue.scheduled_date,
+            "scheduled_start_time": getattr(issue, "scheduled_start_time", None),
+            "scheduled_end_time": getattr(issue, "scheduled_end_time", None),
+            "extended_time": getattr(issue, "extended_time", None),
+            "pushed_to_next_day": getattr(issue, "pushed_to_next_day", False),
             "actual_completion_date": getattr(issue, "actual_completion_date", None) or (issue.updated_at.strftime('%Y-%m-%d') if mapped_status == "completed" and issue.updated_at else None)
         })
         

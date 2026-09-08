@@ -447,6 +447,7 @@ async def check_availability(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user)
 ) -> Any:
+    from app.models.meeting import MeetingStatusEnum
     # 1. Check Meetings
     meetings_res = await db.execute(
         select(Meeting).join(MeetingParticipant).filter(
@@ -454,6 +455,8 @@ async def check_availability(
             MeetingParticipant.status != ParticipantStatusEnum.declined,
             Meeting.date == date,
             Meeting.is_deleted == False,
+            Meeting.status != MeetingStatusEnum.cancelled,
+            Meeting.status != MeetingStatusEnum.completed,
             or_(
                 and_(Meeting.start_time <= start_time, Meeting.end_time > start_time),
                 and_(Meeting.start_time < end_time, Meeting.end_time >= end_time),
@@ -464,10 +467,13 @@ async def check_availability(
     conflicting_meetings = meetings_res.scalars().all()
     
     # 2. Check Tasks Time Blocks
+    from app.models.task import TaskStatusEnum
     tasks_res = await db.execute(
         select(Task).filter(
             Task.assigned_to_id == user_id,
             Task.scheduled_date == date,
+            Task.is_deleted == False,
+            Task.status != TaskStatusEnum.completed,
             or_(
                 and_(Task.scheduled_start_time <= start_time, Task.scheduled_end_time > start_time),
                 and_(Task.scheduled_start_time < end_time, Task.scheduled_end_time >= end_time),
@@ -540,13 +546,17 @@ async def check_availability(
                     MeetingParticipant.user_id == user_id,
                     MeetingParticipant.status != ParticipantStatusEnum.declined,
                     Meeting.date == date,
-                    Meeting.is_deleted == False
+                    Meeting.is_deleted == False,
+                    Meeting.status != MeetingStatusEnum.cancelled,
+                    Meeting.status != MeetingStatusEnum.completed
                 )
             )
             day_tasks_res = await db.execute(
                 select(Task).filter(
                     Task.assigned_to_id == user_id,
-                    Task.scheduled_date == date
+                    Task.scheduled_date == date,
+                    Task.is_deleted == False,
+                    Task.status != TaskStatusEnum.completed
                 )
             )
             

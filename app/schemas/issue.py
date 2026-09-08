@@ -31,6 +31,10 @@ class IssueBase(BaseModel):
     assigned_user_id: Optional[int] = None
     deadline: Optional[str] = None
     scheduled_date: Optional[str] = None
+    scheduled_start_time: Optional[str] = None
+    scheduled_end_time: Optional[str] = None
+    extended_time: Optional[float] = None
+    pushed_to_next_day: Optional[bool] = False
     actual_completion_date: Optional[str] = None
 
 class IssueCreate(IssueBase):

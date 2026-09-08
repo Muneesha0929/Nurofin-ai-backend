@@ -409,6 +409,8 @@ async def create_meeting(
                 .outerjoin(MeetingParticipant, MeetingParticipant.meeting_id == Meeting.id)
                 .filter((Meeting.owner_id.in_(all_ids)) | (MeetingParticipant.user_id.in_(all_ids)))
                 .filter(Meeting.is_deleted == False)
+                .filter(Meeting.status != MeetingStatusEnum.cancelled)
+                .filter(Meeting.status != MeetingStatusEnum.completed)
                 .filter(Meeting.date == meeting_in.date)
             )
             local_result = await db.execute(local_query)
