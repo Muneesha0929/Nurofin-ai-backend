@@ -19,6 +19,10 @@ class TargetUpdate(BaseModel):
 class TargetScoreUpdate(BaseModel):
     score: float
 
+class ReviewerScore(BaseModel):
+    reviewer_id: int
+    score: float
+
 class TargetResponse(TargetBase):
     id: int
     user_id: int
@@ -26,10 +30,10 @@ class TargetResponse(TargetBase):
     is_completed: bool
     completed_at: Optional[datetime] = None
     
-    # We optionally include score and scored_by_id. 
-    # The API endpoint will exclude them for non-authorized users.
-    score: Optional[float] = None
-    scored_by_id: Optional[int] = None
+    average_score: Optional[float] = None
+    score_count: int = 0
+    my_score: Optional[float] = None
+    reviewer_scores: Optional[list[ReviewerScore]] = None
 
     class Config:
         from_attributes = True

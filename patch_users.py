@@ -1,26 +1,23 @@
-import asyncio
-from sqlalchemy.ext.asyncio import create_async_engine
-from sqlalchemy import text
-from dotenv import load_dotenv
-import os
+import re
 
-load_dotenv()
-DATABASE_URL = os.getenv('DATABASE_URL')
-# Patch DATABASE_URL for asyncpg if needed
-if DATABASE_URL.startswith('postgresql://'):
-    DATABASE_URL = DATABASE_URL.replace('postgresql://', 'postgresql+asyncpg://', 1)
+with open('app/api/v1/endpoints/users.py', 'r') as f:
+    content = f.read()
 
-async def patch():
-    engine = create_async_engine(DATABASE_URL)
-    async with engine.begin() as conn:
-        try:
-            await conn.execute(text('ALTER TABLE "user" ADD COLUMN salary FLOAT DEFAULT NULL'))
-            print('Added salary')
-        except Exception as e: print(e)
-        
-        try:
-            await conn.execute(text('ALTER TABLE "user" ADD COLUMN performance_score FLOAT DEFAULT NULL'))
-            print('Added performance_score')
-        except Exception as e: print(e)
+# Replace meeting overlap
+content = re.sub(
+    r'or_\(\s*and_\(Meeting.start_time <= start_time, Meeting.end_time > start_time\),\s*and_\(Meeting.start_time < end_time, Meeting.end_time >= end_time\),\s*and_\(Meeting.start_time >= start_time, Meeting.end_time <= end_time\)\s*\)',
+    r'and_(Meeting.start_time < end_time, Meeting.end_time > start_time)',
+    content,
+    flags=re.MULTILINE
+)
 
-asyncio.run(patch())
+# Replace task overlap
+content = re.sub(
+    r'or_\(\s*and_\(Task.scheduled_start_time <= start_time, Task.scheduled_end_time > start_time\),\s*and_\(Task.scheduled_start_time < end_time, Task.scheduled_end_time >= end_time\),\s*and_\(Task.scheduled_start_time >= start_time, Task.scheduled_end_time <= end_time\)\s*\)',
+    r'and_(Task.scheduled_start_time < end_time, Task.scheduled_end_time > start_time)',
+    content,
+    flags=re.MULTILINE
+)
+
+with open('app/api/v1/endpoints/users.py', 'w') as f:
+    f.write(content)

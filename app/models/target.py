@@ -23,3 +23,4 @@ class Target(Base):
     user = relationship("User", foreign_keys=[user_id])
     created_by = relationship("User", foreign_keys=[created_by_id])
     scored_by = relationship("User", foreign_keys=[scored_by_id])
+    scores = relationship("TargetScore", back_populates="target", cascade="all, delete-orphan")

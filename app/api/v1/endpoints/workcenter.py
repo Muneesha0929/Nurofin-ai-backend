@@ -18,7 +18,7 @@ from app.core.responses import success_response, error_response
 router = APIRouter()
 
 
-async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True, cache: dict = None) -> dict:
+async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True, cache: dict = None, _depth: int = 0) -> dict:
     if cache is None:
         cache = {'users': {}, 'projects': {}, 'visited': set()}
     if 'visited' not in cache:
@@ -28,6 +28,8 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         # Prevent infinite recursion if there is a cycle in subtasks
         return None
     cache['visited'].add(t.id)
+
+    max_subtask_depth = cache.get('max_subtask_depth')
         
     async def get_user_cached(uid):
         if not uid: return None
@@ -44,16 +46,19 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
 
     subtasks = []
     if load_subtasks:
-        try:
-            st_list = [s for s in t.subtasks if not s.is_deleted]
-        except Exception:
-            st_res = await db.execute(select(Task).where(Task.parent_id == t.id, Task.is_deleted == False))
-            st_list = st_res.scalars().all()
-            
-        for s in st_list:
-            serialized_st = await _serialize_task(db, s, load_subtasks=True, cache=cache)
-            if serialized_st is not None:
-                subtasks.append(serialized_st)
+        max_subtask_depth = cache.get('max_subtask_depth')
+        # Enforce a recursion depth cap to avoid exponential N+1 on deep hierarchies
+        if (max_subtask_depth is None) or (_depth < max_subtask_depth):
+            try:
+                st_list = [s for s in t.subtasks if not s.is_deleted]
+            except Exception:
+                st_res = await db.execute(select(Task).where(Task.parent_id == t.id, Task.is_deleted == False))
+                st_list = st_res.scalars().all()
+                
+            for s in st_list:
+                serialized_st = await _serialize_task(db, s, load_subtasks=True, cache=cache, _depth=_depth + 1)
+                if serialized_st is not None:
+                    subtasks.append(serialized_st)
             
     assignee = await get_user_cached(t.assigned_to_id)
     assigner = await get_user_cached(t.assigned_by_id)
@@ -65,21 +70,29 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
     transfer_to_name = None
     if t.parent_id is None:
         try:
-            from app.models.task_history import TaskHistory
-            hist_res = await db.execute(
-                select(TaskHistory)
-                .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
-                .order_by(TaskHistory.created_at.desc())
-                .limit(1)
-            )
-            latest_assigned_history = hist_res.scalars().first()
-            if latest_assigned_history:
-                transfer_date = latest_assigned_history.created_at.strftime("%Y-%m-%d") if latest_assigned_history.created_at else None
-                if latest_assigned_history.new_value and latest_assigned_history.new_value != "None" and latest_assigned_history.new_value.isdigit():
-                    new_assignee_id = int(latest_assigned_history.new_value)
-                    t_user = await get_user_cached(new_assignee_id)
-                    if t_user:
-                        transfer_to_name = t_user.full_name
+            # Prefer a pre-batched lookup when available (list views), else query per task
+            prebuilt = cache.get('history_lookup')
+            if prebuilt is not None:
+                info = prebuilt.get(t.id)
+                if info:
+                    transfer_date = info.get('transfer_date')
+                    transfer_to_name = info.get('transfer_to_name')
+            else:
+                from app.models.task_history import TaskHistory
+                hist_res = await db.execute(
+                    select(TaskHistory)
+                    .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
+                    .order_by(TaskHistory.created_at.desc())
+                    .limit(1)
+                )
+                latest_assigned_history = hist_res.scalars().first()
+                if latest_assigned_history:
+                    transfer_date = latest_assigned_history.created_at.strftime("%Y-%m-%d") if latest_assigned_history.created_at else None
+                    if latest_assigned_history.new_value and latest_assigned_history.new_value != "None" and latest_assigned_history.new_value.isdigit():
+                        new_assignee_id = int(latest_assigned_history.new_value)
+                        t_user = await get_user_cached(new_assignee_id)
+                        if t_user:
+                            transfer_to_name = t_user.full_name
         except Exception:
             pass
 
@@ -263,10 +276,46 @@ async def read_tasks(
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(q.order_by(Task.created_at.desc()).offset((page - 1) * page_size).limit(page_size))
     tasks = result.scalars().all()
-    cache = {'users': {}, 'projects': {}}
+    cache = {'users': {}, 'projects': {}, 'max_subtask_depth': 1}
+
+    # Batch-load the latest "assigned" history entry per parent task in a single query
+    top_ids = [t.id for t in tasks if t.parent_id is None]
+    if top_ids:
+        try:
+            from app.models.task_history import TaskHistory
+            rows = (await db.execute(
+                select(TaskHistory)
+                .where(
+                    TaskHistory.task_id.in_(top_ids),
+                    TaskHistory.action == "assigned",
+                    TaskHistory.is_deleted == False,
+                )
+            )).scalars().all()
+            latest = {}
+            for h in rows:
+                cur = latest.get(h.task_id)
+                if cur is None or (h.created_at and (cur.created_at is None or h.created_at > cur.created_at)):
+                    latest[h.task_id] = h
+            lookup = {}
+            for tid, h in latest.items():
+                transfer_date = h.created_at.strftime("%Y-%m-%d") if h.created_at else None
+                transfer_to_name = None
+                if h.new_value and h.new_value != "None" and h.new_value.isdigit():
+                    u_res = await db.execute(select(User).filter(User.id == int(h.new_value)))
+                    u = u_res.scalars().first()
+                    if u:
+                        transfer_to_name = u.full_name
+                        cache.setdefault('users', {})[u.id] = u
+                lookup[tid] = {'transfer_date': transfer_date, 'transfer_to_name': transfer_to_name}
+            cache['history_lookup'] = lookup
+        except Exception:
+            cache['history_lookup'] = {}
+
     data = []
     for t in tasks:
-        data.append(await _serialize_task(db, t, cache=cache))
+        serialized = await _serialize_task(db, t, cache=cache)
+        if serialized is not None:
+            data.append(serialized)
     return success_response(data={"tasks": data, "total": total, "page": page, "page_size": page_size})
 
 

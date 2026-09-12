@@ -30,3 +30,4 @@ from .performance_score import PerformanceScore
 from .audit_log import AuditLog
 from .target import Target
 from .target_permission import TargetPermission
+from .target_score import TargetScore

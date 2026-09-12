@@ -444,11 +444,14 @@ async def check_availability(
     date: str,
     start_time: str,
     end_time: str,
+    exclude_task_id: Optional[int] = None,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user)
 ) -> Any:
     from app.models.meeting import MeetingStatusEnum
-    # 1. Check Meetings
+    from sqlalchemy import or_, and_
+
+    # 1. Check Meetings where user is a PARTICIPANT (not declined)
     meetings_res = await db.execute(
         select(Meeting).join(MeetingParticipant).filter(
             MeetingParticipant.user_id == user_id,
@@ -457,16 +460,36 @@ async def check_availability(
             Meeting.is_deleted == False,
             Meeting.status != MeetingStatusEnum.cancelled,
             Meeting.status != MeetingStatusEnum.completed,
-            or_(
-                and_(Meeting.start_time <= start_time, Meeting.end_time > start_time),
-                and_(Meeting.start_time < end_time, Meeting.end_time >= end_time),
-                and_(Meeting.start_time >= start_time, Meeting.end_time <= end_time)
-            )
+            Meeting.start_time.isnot(None),
+            Meeting.end_time.isnot(None),
+            Meeting.start_time != '',
+            Meeting.end_time != '',
+            and_(Meeting.start_time < end_time, Meeting.end_time > start_time)
         )
     )
-    conflicting_meetings = meetings_res.scalars().all()
-    
-    # 2. Check Tasks Time Blocks
+    conflicting_meetings = list(meetings_res.scalars().all())
+
+    # Also check meetings where user is the OWNER (host)
+    owner_meetings_res = await db.execute(
+        select(Meeting).filter(
+            Meeting.owner_id == user_id,
+            Meeting.date == date,
+            Meeting.is_deleted == False,
+            Meeting.status != MeetingStatusEnum.cancelled,
+            Meeting.status != MeetingStatusEnum.completed,
+            Meeting.start_time.isnot(None),
+            Meeting.end_time.isnot(None),
+            Meeting.start_time != '',
+            Meeting.end_time != '',
+            and_(Meeting.start_time < end_time, Meeting.end_time > start_time)
+        )
+    )
+    existing_ids = {m.id for m in conflicting_meetings}
+    for m in owner_meetings_res.scalars().all():
+        if m.id not in existing_ids:
+            conflicting_meetings.append(m)
+
+    # 2. Check Tasks Time Blocks — only tasks that HAVE both start and end times set
     from app.models.task import TaskStatusEnum
     tasks_res = await db.execute(
         select(Task).filter(
@@ -474,15 +497,27 @@ async def check_availability(
             Task.scheduled_date == date,
             Task.is_deleted == False,
             Task.status != TaskStatusEnum.completed,
-            or_(
-                and_(Task.scheduled_start_time <= start_time, Task.scheduled_end_time > start_time),
-                and_(Task.scheduled_start_time < end_time, Task.scheduled_end_time >= end_time),
-                and_(Task.scheduled_start_time >= start_time, Task.scheduled_end_time <= end_time)
-            )
+            Task.scheduled_start_time.isnot(None),
+            Task.scheduled_end_time.isnot(None),
+            Task.scheduled_start_time != '',
+            Task.scheduled_end_time != '',
+            Task.id != exclude_task_id if exclude_task_id else True,
+            and_(Task.scheduled_start_time < end_time, Task.scheduled_end_time > start_time)
         )
     )
     conflicting_tasks = tasks_res.scalars().all()
     
+    
+    # Build conflicts array
+    conflicts = []
+    from app.core.scheduling import format_conflict
+    
+    for m in conflicting_meetings:
+        conflicts.append(format_conflict("meeting", m.id, "nurofin", m.title, m.start_time, m.end_time))
+        
+    for t in conflicting_tasks:
+        conflicts.append(format_conflict("task", t.id, "nurofin", t.title, t.scheduled_start_time, t.scheduled_end_time))
+        
     is_busy = len(conflicting_meetings) > 0 or len(conflicting_tasks) > 0
     
     reasons = []
@@ -496,6 +531,8 @@ async def check_availability(
     busy_blocks_google = []
     try:
         from datetime import datetime
+        import pytz
+        
         req_start_dt = datetime.strptime(start_time, "%H:%M").time()
         req_end_dt = datetime.strptime(end_time, "%H:%M").time()
         
@@ -506,17 +543,65 @@ async def check_availability(
             time_min = datetime.fromisoformat(date + "T00:00:00+00:00")
             time_max = datetime.fromisoformat(date + "T23:59:59+00:00")
             g_events = fetch_calendar_events(target_user, time_min, time_max)
+            tz_kolkata = pytz.timezone('Asia/Kolkata')
+            
             for item in g_events:
-                st = item['start'].get('dateTime', item['start'].get('date'))
-                et = item['end'].get('dateTime', item['end'].get('date'))
-                if st and et:
+                # Skip transparent (free) events
+                if item.get('transparency') == 'transparent':
+                    continue
+                    
+                st_dt_str = item['start'].get('dateTime')
+                et_dt_str = item['end'].get('dateTime')
+                st_date_str = item['start'].get('date')
+                
+                # Handle all-day events
+                if st_date_str and not st_dt_str:
+                    # All-day event marked as busy blocks the whole day
+                    conflicts.append({
+                        "type": "google_event",
+                        "id": item.get('id'),
+                        "source": "google_calendar",
+                        "title": item.get('summary', 'Busy'),
+                        "start_time": "00:00",
+                        "end_time": "23:59"
+                    })
+                    conflicting_google.append(item)
+                    busy_blocks_google.append({"start": "00:00", "end": "23:59"})
+                    continue
+                    
+                if st_dt_str and et_dt_str:
                     try:
-                        busy_blocks_google.append({"start": st, "end": et})
-                        b_s = datetime.fromisoformat(st.replace('Z', '+00:00')).time()
-                        b_e = datetime.fromisoformat(et.replace('Z', '+00:00')).time()
-                        if req_start_dt < b_e and req_end_dt > b_s:
-                            conflicting_google.append(item)
-                    except:
+                        # Parse with timezone awareness
+                        b_s_dt = datetime.fromisoformat(st_dt_str.replace('Z', '+00:00'))
+                        b_e_dt = datetime.fromisoformat(et_dt_str.replace('Z', '+00:00'))
+                        
+                        # Convert to Asia/Kolkata
+                        b_s_local = b_s_dt.astimezone(tz_kolkata)
+                        b_e_local = b_e_dt.astimezone(tz_kolkata)
+                        
+                        # Compare dates (in case event spans multiple days in KolKata time)
+                        if b_s_local.strftime('%Y-%m-%d') == date:
+                            b_s = b_s_local.time()
+                            b_e = b_e_local.time()
+                            
+                            # Standard overlap
+                            if req_start_dt < b_e and req_end_dt > b_s:
+                                conflicting_google.append(item)
+                                conflicts.append({
+                                    "type": "google_event",
+                                    "id": item.get('id'),
+                                    "source": "google_calendar",
+                                    "title": item.get('summary', 'Busy'),
+                                    "start_time": b_s_local.strftime('%H:%M'),
+                                    "end_time": b_e_local.strftime('%H:%M')
+                                })
+                            
+                            busy_blocks_google.append({
+                                "start": b_s_local.strftime('%H:%M'),
+                                "end": b_e_local.strftime('%H:%M')
+                            })
+                    except Exception as e:
+                        print(f"Failed parsing google event: {e}")
                         pass
     except Exception as e:
         print(f"Error checking google calendar: {e}")
@@ -527,7 +612,6 @@ async def check_availability(
         reasons.append("busy with Google Calendar event")
         
     status_color = "red" if is_busy else "green"
-    
     alternative_times = []
     if is_busy:
         try:
@@ -581,7 +665,7 @@ async def check_availability(
             pass
         
     return success_response(
-        data={"is_busy": is_busy, "reasons": reasons, "status_color": status_color, "alternative_times": alternative_times},
+        data={"is_busy": is_busy, "reasons": reasons, "conflicts": conflicts, "status_color": status_color, "alternative_times": alternative_times},
         message="Availability checked successfully"
     )
 

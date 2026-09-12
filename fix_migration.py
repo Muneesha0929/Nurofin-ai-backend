@@ -1,24 +1,53 @@
 import re
 
-with open('alembic/versions/0423890795a8_add_is_deleted_to_document.py', 'r') as f:
-    content = f.read()
+with open('alembic/versions/e05d81e7a4a3_add_target_score.py', 'r') as f:
+    lines = f.readlines()
 
-# Revert my bad replace
-content = content.replace('try: op.add_column', 'op.add_column')
-content = content.replace('try: op.create_table', 'op.create_table')
-
-# Now add exception handling properly
-lines = content.split('\n')
 new_lines = []
+skip = False
 for line in lines:
-    if line.strip().startswith('op.'):
-        new_lines.append('    try:')
-        new_lines.append('    ' + line)
-        new_lines.append('    except Exception as e: print("Ignored:", e)')
-    elif line.strip().startswith('sa.Column') or line.strip().startswith('sa.ForeignKeyConstraint') or line.strip().startswith('sa.PrimaryKeyConstraint') or line.strip() == ')':
-        new_lines.append('    ' + line)
-    else:
-        new_lines.append(line)
+    if "op.add_column('financerecord'" in line:
+        continue
+    if "op.alter_column('task'" in line:
+        skip = True
+    if "existing_nullable=True)" in line and skip:
+        skip = False
+        continue
+    if skip:
+        continue
+    
+    if "op.drop_constraint('task_idempotency_key_key'" in line:
+        continue
+    if "op.drop_index('ix_task_idempotency_key'" in line:
+        continue
+    if "op.create_index(op.f('ix_task_idempotency_key'" in line:
+        continue
+    if "op.create_foreign_key(None, 'task', 'quarter'" in line:
+        continue
+    if "op.create_foreign_key(None, 'task', 'task'" in line:
+        continue
+    if "op.create_foreign_key(None, 'task', 'user'" in line:
+        continue
+    if "op.alter_column('user', 'role'" in line:
+        skip = True
+        continue
+    if "op.alter_column('user', 'google_token_expires_at'" in line:
+        skip = True
+        continue
+        
+    # downgrades
+    if "op.drop_constraint(None, 'task', type_='foreignkey')" in line:
+        continue
+    if "op.create_unique_constraint('task_idempotency_key_key'" in line:
+        continue
+    if "op.create_index('ix_task_idempotency_key', 'task'" in line:
+        continue
+    if "op.drop_column('financerecord', 'status')" in line:
+        continue
+    if "op.drop_column('financerecord', 'record_type')" in line:
+        continue
 
-with open('alembic/versions/0423890795a8_add_is_deleted_to_document.py', 'w') as f:
-    f.write('\n'.join(new_lines))
+    new_lines.append(line)
+
+with open('alembic/versions/e05d81e7a4a3_add_target_score.py', 'w') as f:
+    f.writelines(new_lines)

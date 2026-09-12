@@ -1,30 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from typing import List, Any
-from datetime import datetime
+import re
 
-from app.api import deps
-from app.models.user import User
-from app.models.target import Target
-from app.models.target_permission import TargetPermission
-from app.schemas.target import (
-    TargetCreate,
-    TargetUpdate,
-    TargetResponse,
-    TargetScoreUpdate,
-    TargetPermissionCreate,
-    TargetPermissionResponse
-)
+with open('app/api/v1/endpoints/targets.py', 'r') as f:
+    content = f.read()
 
-router = APIRouter()
-
-
+replacement = """
 from sqlalchemy.orm import selectinload
 from app.models.target_score import TargetScore
 
 def is_ceo_or_admin(user: User) -> bool:
-    return user.role in ["ceo", "super_admin", "CEO", "team_lead"] or user.id == 1
+    return user.role in ["ceo", "super_admin", "CEO"] or user.id == 1
 
 def can_manage_all_targets(user: User) -> bool:
     return is_ceo_or_admin(user) or user.role == "team_lead"
@@ -225,58 +209,15 @@ async def score_target(
     result = await db.execute(select(Target).options(selectinload(Target.scores)).filter(Target.id == target_id))
     target = result.scalars().first()
     return prepare_target_response(target, current_user)
-@router.post("/permissions", response_model=TargetPermissionResponse)
-async def create_permission(
-    *,
-    db: AsyncSession = Depends(deps.get_db),
-    perm_in: TargetPermissionCreate,
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    if not is_ceo_or_admin(current_user):
-        raise HTTPException(status_code=403, detail="Only CEO/Admin can delegate permissions")
-        
-    perm = TargetPermission(
-        grantee_id=perm_in.grantee_id,
-        target_user_id=perm_in.target_user_id,
-        can_score=perm_in.can_score,
-        can_add_targets=perm_in.can_add_targets,
-        granted_by_id=current_user.id
-    )
-    db.add(perm)
-    await db.commit()
-    await db.refresh(perm)
-    return perm
+"""
 
+start_idx = content.find("def is_ceo_or_admin")
+end_idx = content.find("@router.post(\"/permissions\"")
 
-@router.get("/permissions", response_model=List[TargetPermissionResponse])
-async def read_permissions(
-    db: AsyncSession = Depends(deps.get_db),
-    skip: int = 0,
-    limit: int = 100,
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    if is_ceo_or_admin(current_user):
-        result = await db.execute(select(TargetPermission).offset(skip).limit(limit))
-    else:
-        result = await db.execute(select(TargetPermission).filter(TargetPermission.grantee_id == current_user.id).offset(skip).limit(limit))
-    return result.scalars().all()
-
-
-@router.delete("/{target_id}", response_model=dict)
-async def delete_target(
-    *,
-    db: AsyncSession = Depends(deps.get_db),
-    target_id: int,
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    result = await db.execute(select(Target).filter(Target.id == target_id))
-    target = result.scalars().first()
-    if not target:
-        raise HTTPException(status_code=404, detail="Target not found")
-        
-    if target.created_by_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not enough permissions to delete this target")
-
-    await db.delete(target)
-    await db.commit()
-    return {"success": True}
+if start_idx != -1 and end_idx != -1:
+    content = content[:start_idx] + replacement + content[end_idx:]
+    with open('app/api/v1/endpoints/targets.py', 'w') as f:
+        f.write(content)
+    print("Patched targets API")
+else:
+    print("Could not find patch points")

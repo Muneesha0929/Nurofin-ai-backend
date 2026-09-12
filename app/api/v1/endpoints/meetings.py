@@ -446,8 +446,10 @@ async def create_meeting(
                         conflict = True
                         break
                 elif "start" in b and "end" in b:
-                    b_s = datetime.fromisoformat(b["start"].replace('Z', '+00:00')).time()
-                    b_e = datetime.fromisoformat(b["end"].replace('Z', '+00:00')).time()
+                    b_s_dt = datetime.fromisoformat(b["start"].replace('Z', '+00:00'))
+                    b_e_dt = datetime.fromisoformat(b["end"].replace('Z', '+00:00'))
+                    b_s = b_s_dt.astimezone().time().replace(tzinfo=None)
+                    b_e = b_e_dt.astimezone().time().replace(tzinfo=None)
                     if req_start_time < b_e and req_end_time > b_s:
                         conflict = True
                         break
