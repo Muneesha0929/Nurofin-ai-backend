@@ -215,7 +215,7 @@ async def read_performance_reviews(
         .options(
             selectinload(PerformanceReview.user),
             selectinload(PerformanceReview.reviewed_by),
-            selectinload(PerformanceReview.quarter),
+            
         )
         .filter(PerformanceReview.is_deleted == False)
         .order_by(PerformanceReview.created_at.desc())

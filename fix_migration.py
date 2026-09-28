@@ -1,53 +1,27 @@
-import re
+﻿import re
 
-with open('alembic/versions/e05d81e7a4a3_add_target_score.py', 'r') as f:
-    lines = f.readlines()
+path = r'C:\Users\Muneesha\Desktop\Nurofin Executive AI\nurofin-ai-backend\alembic\versions\671ace7a50e2_add_performance_review.py'
+with open(path, 'r', encoding='utf-8') as f:
+    code = f.read()
 
-new_lines = []
-skip = False
-for line in lines:
-    if "op.add_column('financerecord'" in line:
-        continue
-    if "op.alter_column('task'" in line:
-        skip = True
-    if "existing_nullable=True)" in line and skip:
-        skip = False
-        continue
-    if skip:
-        continue
-    
-    if "op.drop_constraint('task_idempotency_key_key'" in line:
-        continue
-    if "op.drop_index('ix_task_idempotency_key'" in line:
-        continue
-    if "op.create_index(op.f('ix_task_idempotency_key'" in line:
-        continue
-    if "op.create_foreign_key(None, 'task', 'quarter'" in line:
-        continue
-    if "op.create_foreign_key(None, 'task', 'task'" in line:
-        continue
-    if "op.create_foreign_key(None, 'task', 'user'" in line:
-        continue
-    if "op.alter_column('user', 'role'" in line:
-        skip = True
-        continue
+# Comment out the alter_column block
+target = "op.alter_column('user', 'google_token_expires_at',"
+rep = "# " + target
+
+# It spans multiple lines, so let's just use regex or string replace
+lines = code.split('\n')
+in_alter = False
+for i, line in enumerate(lines):
     if "op.alter_column('user', 'google_token_expires_at'" in line:
-        skip = True
-        continue
-        
-    # downgrades
-    if "op.drop_constraint(None, 'task', type_='foreignkey')" in line:
-        continue
-    if "op.create_unique_constraint('task_idempotency_key_key'" in line:
-        continue
-    if "op.create_index('ix_task_idempotency_key', 'task'" in line:
-        continue
-    if "op.drop_column('financerecord', 'status')" in line:
-        continue
-    if "op.drop_column('financerecord', 'record_type')" in line:
-        continue
+        in_alter = True
+    if in_alter:
+        lines[i] = "# " + line
+        if "existing_nullable=True)" in line:
+            in_alter = False
 
-    new_lines.append(line)
+code = "\n".join(lines)
 
-with open('alembic/versions/e05d81e7a4a3_add_target_score.py', 'w') as f:
-    f.writelines(new_lines)
+with open(path, 'w', encoding='utf-8') as f:
+    f.write(code)
+
+print("Fixed migration script")

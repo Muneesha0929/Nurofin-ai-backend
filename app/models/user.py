@@ -28,6 +28,7 @@ class User(Base):
     # Compensation & Performance
     salary = Column(Float, default=0.0)
     performance_score = Column(Float, default=0.0)
+    can_view_finance = Column(Boolean, default=False)
     
     # Google Calendar Integration
     google_access_token = Column(String, nullable=True)

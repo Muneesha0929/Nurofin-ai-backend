@@ -14,6 +14,7 @@ class UserBase(BaseModel):
     phone: Optional[str] = None
     profile_picture: Optional[str] = None
     is_active: Optional[bool] = True
+    can_view_finance: Optional[bool] = False
 
 # Properties to receive via API on creation
 class UserCreate(UserBase):
