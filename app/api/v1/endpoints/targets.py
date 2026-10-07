@@ -30,7 +30,7 @@ def can_manage_all_targets(user: User) -> bool:
     return is_ceo_or_admin(user) or user.role == "team_lead"
 
 async def can_score_user(db: AsyncSession, current_user: User, target_user_id: int) -> bool:
-    if can_manage_all_targets(current_user):
+    if can_manage_all_targets(current_user) or current_user.id == target_user_id:
         return True
     result = await db.execute(
         select(TargetPermission).filter(
