@@ -35,6 +35,11 @@ class User(Base):
     google_refresh_token = Column(String, nullable=True)
     google_token_expires_at = Column(DateTime, nullable=True)
     
+    # Outlook Calendar Integration
+    outlook_access_token = Column(String, nullable=True)
+    outlook_refresh_token = Column(String, nullable=True)
+    outlook_token_expires_at = Column(DateTime, nullable=True)
+    
     # Relationships
     owned_projects = relationship("Project", back_populates="owner")
     assigned_tasks = relationship("Task", foreign_keys="Task.assigned_to_id", back_populates="assigned_to")

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_SECRET: str = "YOUR_GOOGLE_CLIENT_SECRET"
     GOOGLE_PROJECT_ID: str = "YOUR_PROJECT_ID"
     
+    OUTLOOK_CLIENT_ID: str = "YOUR_OUTLOOK_CLIENT_ID"
+    OUTLOOK_CLIENT_SECRET: str = "YOUR_OUTLOOK_CLIENT_SECRET"
+    
     AWS_ACCESS_KEY_ID: str = ""
     AWS_SECRET_ACCESS_KEY: str = ""
     AWS_REGION: str = "us-east-1"

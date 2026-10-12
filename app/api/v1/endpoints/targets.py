@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import or_
 from typing import List, Any
 from datetime import datetime
 
@@ -23,11 +24,23 @@ router = APIRouter()
 from sqlalchemy.orm import selectinload
 from app.models.target_score import TargetScore
 
+def get_user_role_str(user: User) -> str:
+    if not user:
+        return ""
+    role = getattr(user, 'role', '')
+    if hasattr(role, 'value'):
+        return str(role.value).lower()
+    return str(role).lower()
+
 def is_ceo_or_admin(user: User) -> bool:
-    return user.role in ["ceo", "super_admin", "CEO", "team_lead"] or user.id == 1
+    if user.id == 1:
+        return True
+    return get_user_role_str(user) in ["ceo", "super_admin", "admin"]
 
 def can_manage_all_targets(user: User) -> bool:
-    return is_ceo_or_admin(user) or user.role == "team_lead"
+    if is_ceo_or_admin(user):
+        return True
+    return get_user_role_str(user) in ["team_lead", "lead"]
 
 async def can_score_user(db: AsyncSession, current_user: User, target_user_id: int) -> bool:
     if can_manage_all_targets(current_user) or current_user.id == target_user_id:
@@ -64,12 +77,10 @@ def prepare_target_response(target: Target, current_user: User):
         if s.reviewer_id == current_user.id:
             my_score = float(s.score)
             
-    reviewer_scores = None
-    if is_ceo_or_admin(current_user):
-        reviewer_scores = [
-            {"reviewer_id": s.reviewer_id, "score": float(s.score)}
-            for s in target.scores
-        ]
+    reviewer_scores = [
+        {"reviewer_id": s.reviewer_id, "score": float(s.score)}
+        for s in target.scores
+    ]
 
     data = {
         "id": target.id,
@@ -83,11 +94,9 @@ def prepare_target_response(target: Target, current_user: User):
         "completed_at": target.completed_at,
         "average_score": average_score,
         "score_count": score_count,
-        "my_score": my_score
+        "my_score": my_score,
+        "reviewer_scores": reviewer_scores
     }
-    if reviewer_scores is not None:
-        data["reviewer_scores"] = reviewer_scores
-        
     return data
 
 @router.post("", response_model=Any)
@@ -127,7 +136,11 @@ async def read_my_targets(
     limit: int = 100,
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    result = await db.execute(select(Target).options(selectinload(Target.scores)).filter(Target.user_id == current_user.id).offset(skip).limit(limit))
+    result = await db.execute(
+        select(Target).options(selectinload(Target.scores))
+        .filter(or_(Target.user_id == current_user.id, Target.is_global == True))
+        .offset(skip).limit(limit)
+    )
     targets = result.scalars().all()
     return [prepare_target_response(t, current_user) for t in targets]
 
@@ -139,13 +152,11 @@ async def read_user_targets(
     limit: int = 100,
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    has_permission = await can_score_user(db, current_user, user_id)
-    if not has_permission:
-        if current_user.id == user_id:
-            return await read_my_targets(db, skip, limit, current_user)
-        raise HTTPException(status_code=403, detail="Not enough permissions")
-        
-    result = await db.execute(select(Target).options(selectinload(Target.scores)).filter(Target.user_id == user_id).offset(skip).limit(limit))
+    result = await db.execute(
+        select(Target).options(selectinload(Target.scores))
+        .filter(or_(Target.user_id == user_id, Target.is_global == True))
+        .offset(skip).limit(limit)
+    )
     return [prepare_target_response(t, current_user) for t in result.scalars().all()]
 
 @router.patch("/{target_id}", response_model=Any)
@@ -194,7 +205,12 @@ async def score_target(
     if not target:
         raise HTTPException(status_code=404, detail="Target not found")
         
-    has_permission = await can_score_user(db, current_user, target.user_id)
+    has_permission = (
+        target.is_global
+        or current_user.id == target.user_id
+        or can_manage_all_targets(current_user)
+        or await can_score_user(db, current_user, target.user_id)
+    )
     if not has_permission:
         raise HTTPException(status_code=403, detail="Not enough permissions")
 

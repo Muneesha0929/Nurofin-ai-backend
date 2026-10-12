@@ -11,6 +11,7 @@ from app.models.meeting import Meeting, MeetingParticipant
 from app.models.task import Task
 from app.core.responses import APIResponse, success_response, error_response
 from app.services.google_calendar import get_google_auth_url, exchange_code_for_tokens, fetch_calendar_events
+from app.services.outlook_calendar import get_outlook_auth_url, exchange_code_for_tokens as exchange_outlook_tokens, fetch_calendar_events as fetch_outlook_events
 
 router = APIRouter()
 
@@ -35,6 +36,7 @@ async def get_planner_users(
                 "department": u.department,
                 "profile_picture": u.profile_picture,
                 "google_connected": bool(u.google_access_token),
+                "outlook_connected": bool(u.outlook_access_token),
             }
             for u in users
         ],
@@ -94,6 +96,56 @@ async def disconnect_google(
     await db.commit()
     return success_response(data=None, message="Google Calendar disconnected")
 
+
+
+
+@router.get("/outlook/login", response_model=APIResponse)
+async def login_outlook(
+    redirect_uri: str = Query(default=None),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    if not redirect_uri:
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        redirect_uri = f"{frontend_url}/planner/outlook/callback"
+    auth_url = get_outlook_auth_url(redirect_uri)
+    return success_response(data={"auth_url": auth_url}, message="Outlook Auth URL generated")
+
+
+@router.post("/outlook/callback", response_model=APIResponse)
+async def outlook_callback(
+    code: str = Query(...),
+    redirect_uri: str = Query(default=None),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    if not redirect_uri:
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        redirect_uri = f"{frontend_url}/planner/outlook/callback"
+    try:
+        tokens = exchange_outlook_tokens(code, redirect_uri)
+        current_user.outlook_access_token = tokens["access_token"]
+        current_user.outlook_refresh_token = tokens["refresh_token"]
+        current_user.outlook_token_expires_at = tokens["expires_at"]
+
+        await db.commit()
+        await db.refresh(current_user)
+        return success_response(data=None, message="Outlook Calendar connected successfully")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"Failed to connect Outlook Calendar: {str(e)}")
+
+
+@router.post("/outlook/disconnect", response_model=APIResponse)
+async def disconnect_outlook(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    current_user.outlook_access_token = None
+    current_user.outlook_refresh_token = None
+    current_user.outlook_token_expires_at = None
+    await db.commit()
+    return success_response(data=None, message="Outlook Calendar disconnected")
 
 @router.get("/schedule/{target_user_id}", response_model=APIResponse)
 async def get_user_schedule(
@@ -311,6 +363,7 @@ async def get_user_schedule(
                 "id": target_user.id,
                 "full_name": target_user.full_name,
                 "google_connected": bool(target_user.google_access_token),
+                "outlook_connected": bool(target_user.outlook_access_token),
             },
             "schedule": schedule
         },
@@ -440,6 +493,7 @@ async def check_availability(
                 "department": u.department,
                 "profile_picture": u.profile_picture,
                 "google_connected": bool(u.google_access_token),
+                "outlook_connected": bool(u.outlook_access_token),
             }
             for u in users
         ],
@@ -499,6 +553,56 @@ async def disconnect_google(
     await db.commit()
     return success_response(data=None, message="Google Calendar disconnected")
 
+
+
+
+@router.get("/outlook/login", response_model=APIResponse)
+async def login_outlook(
+    redirect_uri: str = Query(default=None),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    if not redirect_uri:
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        redirect_uri = f"{frontend_url}/planner/outlook/callback"
+    auth_url = get_outlook_auth_url(redirect_uri)
+    return success_response(data={"auth_url": auth_url}, message="Outlook Auth URL generated")
+
+
+@router.post("/outlook/callback", response_model=APIResponse)
+async def outlook_callback(
+    code: str = Query(...),
+    redirect_uri: str = Query(default=None),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    if not redirect_uri:
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        redirect_uri = f"{frontend_url}/planner/outlook/callback"
+    try:
+        tokens = exchange_outlook_tokens(code, redirect_uri)
+        current_user.outlook_access_token = tokens["access_token"]
+        current_user.outlook_refresh_token = tokens["refresh_token"]
+        current_user.outlook_token_expires_at = tokens["expires_at"]
+
+        await db.commit()
+        await db.refresh(current_user)
+        return success_response(data=None, message="Outlook Calendar connected successfully")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=400, detail=f"Failed to connect Outlook Calendar: {str(e)}")
+
+
+@router.post("/outlook/disconnect", response_model=APIResponse)
+async def disconnect_outlook(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    current_user.outlook_access_token = None
+    current_user.outlook_refresh_token = None
+    current_user.outlook_token_expires_at = None
+    await db.commit()
+    return success_response(data=None, message="Outlook Calendar disconnected")
 
 @router.get("/schedule/{target_user_id}", response_model=APIResponse)
 async def get_user_schedule(
@@ -716,6 +820,7 @@ async def get_user_schedule(
                 "id": target_user.id,
                 "full_name": target_user.full_name,
                 "google_connected": bool(target_user.google_access_token),
+                "outlook_connected": bool(target_user.outlook_access_token),
             },
             "schedule": schedule
         },
