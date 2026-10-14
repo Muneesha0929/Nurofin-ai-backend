@@ -410,6 +410,29 @@ async def delete_department(
     return success_response(message="Department deleted")
 
 
+@router.post("/departments/{dept_id}/restore", response_model=APIResponse)
+async def restore_department(
+    dept_id: int,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Undo a delete. Deleting only hides the department, so its targets and objectives come back too."""
+    require_director(current_user)
+    dept = (await db.execute(select(TargetDepartment).filter(TargetDepartment.id == dept_id))).scalars().first()
+    if not dept:
+        raise HTTPException(status_code=404, detail="Department not found.")
+    if dept.is_deleted:
+        clash = (await db.execute(
+            select(TargetDepartment).filter(TargetDepartment.name.ilike(dept.name), TargetDepartment.id != dept_id, TargetDepartment.is_deleted == False)
+        )).scalars().first()
+        if clash:
+            raise HTTPException(status_code=400, detail="Another department now has this name. Rename it first, then undo.")
+        dept.is_deleted = False
+        await db.commit()
+    dept = await get_department(db, dept_id)
+    return success_response(data=dept_payload(dept), message="Department restored")
+
+
 @router.get("/departments/{dept_id}", response_model=APIResponse)
 async def department_detail(
     dept_id: int,
