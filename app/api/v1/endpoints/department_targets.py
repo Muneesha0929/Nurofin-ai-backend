@@ -156,9 +156,28 @@ def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[L
             "children": kids,
         }
 
-    if root_ids is not None:
-        return [node(o) for o in objs if o.id in root_ids]
-    return [node(o) for o in children.get(None, [])]
+    roots = [node(o) for o in objs if o.id in root_ids] if root_ids is not None else [node(o) for o in children.get(None, [])]
+    for r in roots:
+        r["health"] = health(r)
+    return roots
+
+
+def health(n: Dict[str, Any]) -> str:
+    """Like the design: done; off track if an overdue item is under 50%; at risk if anything is overdue; else on track."""
+    if n["progress"] >= 100:
+        return "done"
+    late: List[Dict[str, Any]] = []
+
+    def walk(x):
+        if not x["children"] and x["overdue"]:
+            late.append(x)
+        for c in x["children"]:
+            walk(c)
+
+    walk(n)
+    if any(x["progress"] < 50 for x in late):
+        return "off"
+    return "risk" if late else "on"
 
 
 def summarize(tree: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -176,6 +195,7 @@ def summarize(tree: List[Dict[str, Any]]) -> Dict[str, Any]:
         "items": len(flat),
         "done": sum(1 for n in flat if n["status"] == "done"),
         "overdue": sum(1 for n in flat if n["overdue"] and not n["children"]),
+        "health": {k: sum(1 for n in tree if n["health"] == k) for k in ("on", "risk", "off", "done")},
     }
 
 
