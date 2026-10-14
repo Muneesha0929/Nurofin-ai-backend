@@ -31,4 +31,4 @@ from .audit_log import AuditLog
 from .target import Target
 from .target_permission import TargetPermission
 from .target_score import TargetScore
-from .department_target import TargetDepartment, CompanyQuarterGoal, DepartmentQuarterTarget, DepartmentObjective, target_department_members
+from .department_target import TargetDepartment, CompanyQuarterGoal, DepartmentQuarterTarget, DepartmentObjective, DepartmentObjectiveUpdate, target_department_members

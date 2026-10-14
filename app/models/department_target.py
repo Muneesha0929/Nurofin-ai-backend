@@ -81,3 +81,15 @@ class DepartmentObjective(Base):
     created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
 
     owner = relationship("User", foreign_keys=[owner_id])
+
+
+class DepartmentObjectiveUpdate(Base):
+    """A short progress update posted on an objective or sub-objective."""
+    __tablename__ = "department_objective_update"
+
+    id = Column(Integer, primary_key=True, index=True)
+    objective_id = Column(Integer, ForeignKey("department_objective.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("user.id"), nullable=False)
+    text = Column(Text, nullable=False)
+
+    user = relationship("User", foreign_keys=[user_id])

@@ -44,3 +44,7 @@ class ObjectiveUpdate(BaseModel):
     deadline: Optional[str] = Field(None, pattern=DATE_PATTERN)
     status: Optional[Literal["not_started", "in_progress", "done"]] = None
     progress: Optional[float] = Field(None, ge=0, le=100)
+
+
+class ObjectiveUpdatePost(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4000)

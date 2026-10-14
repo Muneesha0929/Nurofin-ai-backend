@@ -4,7 +4,7 @@ Revision ID: a7c3e91d2f10
 Revises: 671ace7a50e2
 Create Date: 2026-10-14 18:30:00.000000
 
-Additive only: four new tables plus one join table. No existing table is touched.
+Additive only: five new tables plus one join table. No existing table is touched.
 Each create is skipped if the table already exists (init_db's create_all may have made it).
 """
 from typing import Sequence, Union
@@ -104,8 +104,21 @@ def upgrade() -> None:
         op.create_index('ix_department_objective_department_id', 'department_objective', ['department_id'])
         op.create_index('ix_department_objective_parent_id', 'department_objective', ['parent_id'])
 
+    if 'department_objective_update' not in existing:
+        op.create_table(
+            'department_objective_update',
+            sa.Column('id', sa.Integer(), primary_key=True),
+            sa.Column('objective_id', sa.Integer(), sa.ForeignKey('department_objective.id'), nullable=False),
+            sa.Column('user_id', sa.Integer(), sa.ForeignKey('user.id'), nullable=False),
+            sa.Column('text', sa.Text(), nullable=False),
+            *_base_columns(),
+        )
+        op.create_index('ix_department_objective_update_id', 'department_objective_update', ['id'])
+        op.create_index('ix_department_objective_update_objective_id', 'department_objective_update', ['objective_id'])
+
 
 def downgrade() -> None:
+    op.drop_table('department_objective_update')
     op.drop_table('department_objective')
     op.drop_table('department_quarter_target')
     op.drop_table('company_quarter_goal')

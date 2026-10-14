@@ -6,6 +6,7 @@ Who can do what:
   department messages, mark the quarter result.
 - HOD of a department: read the message, add / edit / delete that department's objectives.
 - Owner of an objective: update its status and progress.
+- Director, HOD, owner and department members: post updates on an objective.
 - Everyone signed in: read.
 """
 from datetime import date, datetime
@@ -21,6 +22,7 @@ from app.core.responses import APIResponse, success_response
 from app.models.department_target import (
     CompanyQuarterGoal,
     DepartmentObjective,
+    DepartmentObjectiveUpdate,
     DepartmentQuarterTarget,
     TargetDepartment,
 )
@@ -32,6 +34,7 @@ from app.schemas.department_target import (
     DepartmentUpdate,
     ObjectiveCreate,
     ObjectiveUpdate,
+    ObjectiveUpdatePost,
     QuarterTargetUpdate,
 )
 
@@ -127,7 +130,7 @@ def leaf_progress(o: DepartmentObjective) -> float:
     return 100.0 if o.status == "done" else float(o.progress or 0)
 
 
-def build_tree(objs: List[DepartmentObjective], today: str) -> List[Dict[str, Any]]:
+def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
     """Objectives with their sub-objectives; a parent's progress is the average of its children."""
     children: Dict[Optional[int], List[DepartmentObjective]] = {}
     for o in objs:
@@ -153,6 +156,8 @@ def build_tree(objs: List[DepartmentObjective], today: str) -> List[Dict[str, An
             "children": kids,
         }
 
+    if root_ids is not None:
+        return [node(o) for o in objs if o.id in root_ids]
     return [node(o) for o in children.get(None, [])]
 
 
@@ -646,3 +651,136 @@ async def delete_objective(
         k.is_deleted = True
     await db.commit()
     return success_response(message="Objective deleted")
+
+
+@router.get("/objectives/{obj_id}", response_model=APIResponse)
+async def objective_detail(
+    obj_id: int,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """One objective for the side panel: where it sits, its sub-objectives and its updates."""
+    o = await get_objective(db, obj_id)
+    dept = await get_department(db, o.department_id)
+    today = date.today().isoformat()
+    family = [x for x in await objectives_for(db, [dept.id], o.fiscal_year, o.quarter_number) if x.id == o.id or x.parent_id == o.id]
+    node = build_tree(family, today, root_ids=[o.id])[0]
+    parent = await get_objective(db, o.parent_id) if o.parent_id else None
+    target = (await db.execute(
+        select(DepartmentQuarterTarget).filter(
+            DepartmentQuarterTarget.department_id == dept.id,
+            DepartmentQuarterTarget.fiscal_year == o.fiscal_year,
+            DepartmentQuarterTarget.quarter_number == o.quarter_number,
+            DepartmentQuarterTarget.is_deleted == False,
+        )
+    )).scalars().first()
+    updates = (await db.execute(
+        select(DepartmentObjectiveUpdate)
+        .options(selectinload(DepartmentObjectiveUpdate.user))
+        .filter(DepartmentObjectiveUpdate.objective_id == o.id, DepartmentObjectiveUpdate.is_deleted == False)
+        .order_by(DepartmentObjectiveUpdate.created_at)
+    )).scalars().all()
+    planner = can_plan(current_user, dept)
+    return success_response(data={
+        **node,
+        "description": o.description,
+        "level": "sub_objective" if o.parent_id else "objective",
+        "department": {"id": dept.id, "name": dept.name, "hod": user_brief(dept.hod)},
+        "quarter": quarter_info(o.fiscal_year, o.quarter_number),
+        "director_message": target.message if target else None,
+        "parent": {"id": parent.id, "title": parent.title} if parent else None,
+        "updates": [
+            {"id": u.id, "user": user_brief(u.user), "text": u.text, "created_at": u.created_at.isoformat() if u.created_at else None}
+            for u in updates
+        ],
+        "permissions": {
+            "can_plan": planner,
+            "can_update_progress": not node["children"] and (planner or o.owner_id == current_user.id),
+            "can_post": can_post_update(current_user, dept, o),
+        },
+    }, message="Objective fetched")
+
+
+def can_post_update(user: User, dept: TargetDepartment, o: DepartmentObjective) -> bool:
+    return can_plan(user, dept) or o.owner_id == user.id or any(m.id == user.id for m in dept.members)
+
+
+@router.post("/objectives/{obj_id}/updates", response_model=APIResponse)
+async def post_objective_update(
+    obj_id: int,
+    update_in: ObjectiveUpdatePost,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    o = await get_objective(db, obj_id)
+    dept = await get_department(db, o.department_id)
+    if not can_post_update(current_user, dept, o):
+        raise HTTPException(status_code=403, detail="Only people in this department can post updates here.")
+    u = DepartmentObjectiveUpdate(objective_id=o.id, user_id=current_user.id, text=update_in.text.strip())
+    db.add(u)
+    for uid in {o.owner_id, dept.hod_id} - {None, current_user.id}:
+        db.add(Notification(
+            title="New update on an objective",
+            message=f"{current_user.full_name or current_user.email} on \"{o.title}\": {u.text[:120]}",
+            type=NotificationTypeEnum.project_update,
+            user_id=uid,
+            link=f"/departments?id={dept.id}",
+        ))
+    await db.commit()
+    return success_response(data={"id": u.id}, message="Update posted")
+
+
+@router.get("/deadlines", response_model=APIResponse)
+async def deadlines(
+    start: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    end: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    everyone: bool = Query(False),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Objective deadlines between two dates for the dashboard calendar.
+
+    Default: the caller's own items, plus every item in departments they head.
+    `everyone=true` (Director only): all departments.
+    """
+    stmt = (
+        select(DepartmentObjective)
+        .options(selectinload(DepartmentObjective.owner))
+        .join(TargetDepartment, TargetDepartment.id == DepartmentObjective.department_id)
+        .filter(
+            DepartmentObjective.is_deleted == False,
+            TargetDepartment.is_deleted == False,
+            DepartmentObjective.deadline >= start,
+            DepartmentObjective.deadline <= end,
+        )
+    )
+    if not (everyone and is_director(current_user)):
+        hod_of = select(TargetDepartment.id).filter(TargetDepartment.hod_id == current_user.id, TargetDepartment.is_deleted == False)
+        stmt = stmt.filter((DepartmentObjective.owner_id == current_user.id) | (DepartmentObjective.department_id.in_(hod_of)))
+    objs = list((await db.execute(stmt.order_by(DepartmentObjective.deadline))).scalars().all())
+    depts = {d.id: d.name for d in (await db.execute(select(TargetDepartment).filter(TargetDepartment.id.in_({o.department_id for o in objs} or {0})))).scalars().all()}
+    # parents' progress depends on their children, which may fall outside the date range
+    parent_ids = [o.id for o in objs if o.parent_id is None]
+    kids: Dict[int, List[DepartmentObjective]] = {}
+    if parent_ids:
+        for k in (await db.execute(select(DepartmentObjective).filter(DepartmentObjective.parent_id.in_(parent_ids), DepartmentObjective.is_deleted == False))).scalars().all():
+            kids.setdefault(k.parent_id, []).append(k)
+    today = date.today().isoformat()
+    items = []
+    for o in objs:
+        ks = kids.get(o.id, [])
+        progress = round(sum(leaf_progress(k) for k in ks) / len(ks), 1) if ks else leaf_progress(o)
+        done = progress >= 100
+        items.append({
+            "id": o.id,
+            "title": o.title,
+            "deadline": o.deadline,
+            "level": "sub_objective" if o.parent_id else "objective",
+            "department": {"id": o.department_id, "name": depts.get(o.department_id)},
+            "owner": user_brief(o.owner),
+            "progress": progress,
+            "status": "done" if done else (o.status or "not_started"),
+            "overdue": o.deadline < today and not done,
+            "mine": o.owner_id == current_user.id,
+        })
+    return success_response(data=items, message="Deadlines fetched")
