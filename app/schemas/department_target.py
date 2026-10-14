@@ -48,3 +48,36 @@ class ObjectiveUpdate(BaseModel):
 
 class ObjectiveUpdatePost(BaseModel):
     text: str = Field(..., min_length=1, max_length=4000)
+
+
+WIDGET_KINDS = Literal["number", "money", "percent", "milestone"]
+
+
+class WidgetCreate(BaseModel):
+    fiscal_year: int
+    quarter_number: int
+    title: str = Field(..., min_length=1, max_length=200)
+    kind: WIDGET_KINDS = "number"
+    unit: Optional[str] = Field(None, max_length=30)
+    base: float = 0
+    current: float = 0
+    target: float = 0
+    lower_is_better: bool = False
+    department_id: Optional[int] = None
+    note: Optional[str] = Field(None, max_length=1000)
+
+
+class WidgetUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    kind: Optional[WIDGET_KINDS] = None
+    unit: Optional[str] = Field(None, max_length=30)
+    base: Optional[float] = None
+    current: Optional[float] = None
+    target: Optional[float] = None
+    lower_is_better: Optional[bool] = None
+    department_id: Optional[int] = None
+    note: Optional[str] = Field(None, max_length=1000)
+
+
+class WidgetOrder(BaseModel):
+    ids: List[int] = Field(..., max_length=100)

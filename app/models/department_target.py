@@ -3,24 +3,27 @@
 Kept separate from `department` / `role` (which User Management uses as a role catalogue):
 these departments are created by the Director and start empty.
 
+Table names start with cos_ ("Chief of Staff"): production already had hand-made tables
+called department_objective etc., so generic names are not safe in this database.
+
 Fiscal quarters follow the Indian financial year: Q1 = Apr–Jun ... Q4 = Jan–Mar,
 and `fiscal_year` is the calendar year the FY starts in (FY 2026-27 -> 2026).
 """
-from sqlalchemy import Column, Integer, String, Text, Float, ForeignKey, Table, DateTime, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Text, Float, ForeignKey, Table, DateTime, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.db.base_class import Base
 
 
 target_department_members = Table(
-    "target_department_member",
+    "cos_department_member",
     Base.metadata,
-    Column("department_id", Integer, ForeignKey("target_department.id"), primary_key=True),
+    Column("department_id", Integer, ForeignKey("cos_department.id"), primary_key=True),
     Column("user_id", Integer, ForeignKey("user.id"), primary_key=True),
 )
 
 
 class TargetDepartment(Base):
-    __tablename__ = "target_department"
+    __tablename__ = "cos_department"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
@@ -33,8 +36,8 @@ class TargetDepartment(Base):
 
 class CompanyQuarterGoal(Base):
     """The one-line company target for a quarter (shown in bold on the Overview)."""
-    __tablename__ = "company_quarter_goal"
-    __table_args__ = (UniqueConstraint("fiscal_year", "quarter_number", name="uix_company_quarter_goal"),)
+    __tablename__ = "cos_company_goal"
+    __table_args__ = (UniqueConstraint("fiscal_year", "quarter_number", name="uix_cos_company_goal"),)
 
     id = Column(Integer, primary_key=True, index=True)
     fiscal_year = Column(Integer, nullable=False)
@@ -45,11 +48,11 @@ class CompanyQuarterGoal(Base):
 
 class DepartmentQuarterTarget(Base):
     """The Director's message to one department for one quarter, and the quarter result he marks."""
-    __tablename__ = "department_quarter_target"
-    __table_args__ = (UniqueConstraint("department_id", "fiscal_year", "quarter_number", name="uix_department_quarter_target"),)
+    __tablename__ = "cos_quarter_target"
+    __table_args__ = (UniqueConstraint("department_id", "fiscal_year", "quarter_number", name="uix_cos_quarter_target"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    department_id = Column(Integer, ForeignKey("target_department.id"), nullable=False, index=True)
+    department_id = Column(Integer, ForeignKey("cos_department.id"), nullable=False, index=True)
     fiscal_year = Column(Integer, nullable=False)
     quarter_number = Column(Integer, nullable=False)
     message = Column(Text, nullable=True)
@@ -64,13 +67,13 @@ class DepartmentQuarterTarget(Base):
 
 class DepartmentObjective(Base):
     """An objective the HOD sets from the Director's message. `parent_id` makes it a sub-objective."""
-    __tablename__ = "department_objective"
+    __tablename__ = "cos_objective"
 
     id = Column(Integer, primary_key=True, index=True)
-    department_id = Column(Integer, ForeignKey("target_department.id"), nullable=False, index=True)
+    department_id = Column(Integer, ForeignKey("cos_department.id"), nullable=False, index=True)
     fiscal_year = Column(Integer, nullable=False)
     quarter_number = Column(Integer, nullable=False)
-    parent_id = Column(Integer, ForeignKey("department_objective.id"), nullable=True, index=True)
+    parent_id = Column(Integer, ForeignKey("cos_objective.id"), nullable=True, index=True)
     title = Column(String, nullable=False)
     description = Column(Text, nullable=True)
     owner_id = Column(Integer, ForeignKey("user.id"), nullable=True)
@@ -85,11 +88,31 @@ class DepartmentObjective(Base):
 
 class DepartmentObjectiveUpdate(Base):
     """A short progress update posted on an objective or sub-objective."""
-    __tablename__ = "department_objective_update"
+    __tablename__ = "cos_objective_update"
 
     id = Column(Integer, primary_key=True, index=True)
-    objective_id = Column(Integer, ForeignKey("department_objective.id"), nullable=False, index=True)
+    objective_id = Column(Integer, ForeignKey("cos_objective.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("user.id"), nullable=False)
     text = Column(Text, nullable=False)
 
     user = relationship("User", foreign_keys=[user_id])
+
+
+class CompanyWidget(Base):
+    """One company target card (T1, T2 ...) on the Overview. The Director adds, edits and orders them per quarter."""
+    __tablename__ = "cos_company_widget"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fiscal_year = Column(Integer, nullable=False)
+    quarter_number = Column(Integer, nullable=False)
+    sort_order = Column(Integer, default=0)
+    title = Column(String, nullable=False)
+    kind = Column(String, default="number")  # number | money | percent | milestone
+    unit = Column(String, nullable=True)      # e.g. "Cr", "L", "merchants"
+    base = Column(Float, default=0.0)         # value at the start of the quarter
+    current = Column(Float, default=0.0)
+    target = Column(Float, default=0.0)
+    lower_is_better = Column(Boolean, default=False)
+    department_id = Column(Integer, ForeignKey("cos_department.id"), nullable=True)
+    note = Column(Text, nullable=True)
+    updated_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)

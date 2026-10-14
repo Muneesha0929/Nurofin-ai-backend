@@ -15,12 +15,14 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import selectinload
 
 from app.api import deps
 from app.core.responses import APIResponse, success_response
 from app.models.department_target import (
     CompanyQuarterGoal,
+    CompanyWidget,
     DepartmentObjective,
     DepartmentObjectiveUpdate,
     DepartmentQuarterTarget,
@@ -35,6 +37,9 @@ from app.schemas.department_target import (
     ObjectiveCreate,
     ObjectiveUpdate,
     ObjectiveUpdatePost,
+    WidgetCreate,
+    WidgetOrder,
+    WidgetUpdate,
     QuarterTargetUpdate,
 )
 
@@ -296,9 +301,16 @@ async def overview(
             new_targets.append({"department_id": d.id, "department_name": d.name, "objectives": stats["objectives"]})
         departments.append({**dept_payload(d), **target_payload(t), **stats, "new_for_me": unread})
 
+    widgets = (await db.execute(
+        select(CompanyWidget).filter(CompanyWidget.fiscal_year == fy, CompanyWidget.quarter_number == q, CompanyWidget.is_deleted == False)
+        .order_by(CompanyWidget.sort_order, CompanyWidget.id)
+    )).scalars().all()
+    names = {d.id: d.name for d in depts}
+
     return success_response(data={
         "quarter": quarter_info(fy, q),
         "headline": goal.headline if goal else None,
+        "widgets": [widget_payload(w, names) for w in widgets],
         "progress": round(sum(progress_values) / len(progress_values), 1) if progress_values else None,
         "totals": totals,
         "departments": departments,
@@ -827,3 +839,139 @@ async def deadlines(
             "mine": o.owner_id == current_user.id,
         })
     return success_response(data=items, message="Deadlines fetched")
+
+
+# ----------------------------------------------------------------- company target widgets
+
+def widget_payload(w: CompanyWidget, dept_names: Dict[int, str]) -> Dict[str, Any]:
+    span = (w.base or 0) - (w.target or 0) if w.lower_is_better else (w.target or 0) - (w.base or 0)
+    moved = (w.base or 0) - (w.current or 0) if w.lower_is_better else (w.current or 0) - (w.base or 0)
+    if w.kind == "milestone":
+        progress = 100.0 if (w.current or 0) >= 1 else 0.0
+    else:
+        progress = max(0.0, min(100.0, moved / span * 100)) if span else (100.0 if moved >= 0 and w.current == w.target else 0.0)
+    return {
+        "id": w.id, "title": w.title, "kind": w.kind or "number", "unit": w.unit,
+        "base": w.base or 0, "current": w.current or 0, "target": w.target or 0,
+        "lower_is_better": bool(w.lower_is_better), "note": w.note, "progress": round(progress, 1),
+        "department": {"id": w.department_id, "name": dept_names.get(w.department_id)} if w.department_id else None,
+    }
+
+
+async def get_widget(db: AsyncSession, wid: int) -> CompanyWidget:
+    w = (await db.execute(select(CompanyWidget).filter(CompanyWidget.id == wid, CompanyWidget.is_deleted == False))).scalars().first()
+    if not w:
+        raise HTTPException(status_code=404, detail="Widget not found.")
+    return w
+
+
+async def dept_names_for(db: AsyncSession) -> Dict[int, str]:
+    return {d.id: d.name for d in (await db.execute(select(TargetDepartment).filter(TargetDepartment.is_deleted == False))).scalars().all()}
+
+
+@router.post("/widgets", response_model=APIResponse)
+async def create_widget(w_in: WidgetCreate, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    check_quarter(w_in.fiscal_year, w_in.quarter_number)
+    if w_in.department_id:
+        await get_department(db, w_in.department_id)
+    count = len((await db.execute(select(CompanyWidget.id).filter(
+        CompanyWidget.fiscal_year == w_in.fiscal_year, CompanyWidget.quarter_number == w_in.quarter_number, CompanyWidget.is_deleted == False
+    ))).all())
+    w = CompanyWidget(**w_in.model_dump(), sort_order=count, updated_by_id=current_user.id)
+    w.title = w.title.strip()
+    db.add(w)
+    await db.commit()
+    return success_response(data=widget_payload(w, await dept_names_for(db)), message="Widget added")
+
+
+@router.put("/widgets/order", response_model=APIResponse)
+async def reorder_widgets(order: WidgetOrder, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    rows = {w.id: w for w in (await db.execute(select(CompanyWidget).filter(CompanyWidget.id.in_(order.ids or [0]), CompanyWidget.is_deleted == False))).scalars().all()}
+    for i, wid in enumerate(order.ids):
+        if wid in rows:
+            rows[wid].sort_order = i
+    await db.commit()
+    return success_response(message="Order saved")
+
+
+@router.put("/widgets/{wid}", response_model=APIResponse)
+async def update_widget(wid: int, w_in: WidgetUpdate, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    w = await get_widget(db, wid)
+    data = w_in.model_dump(exclude_unset=True)
+    if data.get("department_id"):
+        await get_department(db, data["department_id"])
+    for k, v in data.items():
+        setattr(w, k, v.strip() if k == "title" and isinstance(v, str) else v)
+    w.updated_by_id = current_user.id
+    await db.commit()
+    return success_response(data=widget_payload(w, await dept_names_for(db)), message="Widget saved")
+
+
+@router.delete("/widgets/{wid}", response_model=APIResponse)
+async def delete_widget(wid: int, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    w = await get_widget(db, wid)
+    w.is_deleted = True
+    await db.commit()
+    return success_response(message="Widget deleted")
+
+
+# ----------------------------------------------------------------- self-check
+
+@router.get("/self-check", response_model=APIResponse)
+async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    """Director only. Compares each table with the code, then tries a full write inside a
+    transaction that is rolled back, so nothing is saved."""
+    require_director(current_user)
+    from app.db.base_class import Base
+    from app.db.session import engine
+
+    tables = ["cos_department", "cos_department_member", "cos_company_goal", "cos_quarter_target",
+              "cos_objective", "cos_objective_update", "cos_company_widget"]
+    report: Dict[str, Any] = {"tables": {}, "write_test": None}
+
+    def inspect_tables(sync_conn):
+        insp = sa_inspect(sync_conn)
+        have = set(insp.get_table_names())
+        out = {}
+        for name in tables:
+            model = Base.metadata.tables[name]
+            if name not in have:
+                out[name] = {"ok": False, "problem": "table missing"}
+                continue
+            cols = {c["name"]: c for c in insp.get_columns(name)}
+            missing = [c.name for c in model.columns if c.name not in cols]
+            extra_required = [n for n, c in cols.items() if n not in model.c and not c["nullable"] and c.get("default") is None]
+            out[name] = {"ok": not missing and not extra_required, "missing_columns": missing, "unknown_required_columns": extra_required}
+        return out
+
+    async with engine.connect() as conn:
+        report["tables"] = await conn.run_sync(inspect_tables)
+    async with engine.connect() as conn:
+        trans = await conn.begin()
+        step = "start"
+        try:
+            md = Base.metadata.tables
+            step = "department"
+            dep_id = (await conn.execute(md["cos_department"].insert().values(name="__self_check__", is_deleted=False).returning(md["cos_department"].c.id))).scalar()
+            step = "quarter target"
+            await conn.execute(md["cos_quarter_target"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, message="x", is_deleted=False))
+            step = "objective"
+            oid = (await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, title="x", deadline="2000-04-30", status="not_started", progress=0, sort_order=0, is_deleted=False).returning(md["cos_objective"].c.id))).scalar()
+            step = "sub-objective"
+            await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, parent_id=oid, title="y", is_deleted=False))
+            step = "objective update"
+            await conn.execute(md["cos_objective_update"].insert().values(objective_id=oid, user_id=current_user.id, text="x", is_deleted=False))
+            step = "company widget"
+            await conn.execute(md["cos_company_widget"].insert().values(fiscal_year=2000, quarter_number=1, title="x", kind="money", is_deleted=False))
+            report["write_test"] = {"ok": True}
+        except Exception as e:
+            report["write_test"] = {"ok": False, "failed_at": step, "error": f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"}
+        finally:
+            await trans.rollback()
+
+    report["ok"] = all(t["ok"] for t in report["tables"].values()) and report["write_test"]["ok"]
+    return success_response(data=report, message="Self-check finished")

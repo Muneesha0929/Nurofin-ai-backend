@@ -40,7 +40,10 @@ def upgrade() -> None:
     existing = set(insp.get_table_names())
 
     for name in TABLES:
-        table = Base.metadata.tables[name]
+        # Superseded by c9e5a1d7b3f4 (tables renamed to cos_*). Kept so the history still runs.
+        table = Base.metadata.tables.get(name)
+        if table is None:
+            continue
         if name not in existing:
             table.create(bind)
             continue
