@@ -116,3 +116,21 @@ class CompanyWidget(Base):
     department_id = Column(Integer, ForeignKey("cos_department.id"), nullable=True)
     note = Column(Text, nullable=True)
     updated_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
+
+
+class MonthlyTarget(Base):
+    """A dated target on the Overview's right side, e.g. "10 lakh transactions by 30 Nov".
+    The Director sets it; the Director or the responsible department's HOD updates the current value."""
+    __tablename__ = "cos_monthly_target"
+
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, nullable=False)
+    kind = Column(String, default="number")  # number | money | percent | milestone
+    unit = Column(String, nullable=True)
+    target = Column(Float, default=0.0)
+    current = Column(Float, default=0.0)
+    due_date = Column(String, nullable=False)  # YYYY-MM-DD
+    department_id = Column(Integer, ForeignKey("cos_department.id"), nullable=True)
+    note = Column(Text, nullable=True)
+    sort_order = Column(Integer, default=0)
+    updated_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)

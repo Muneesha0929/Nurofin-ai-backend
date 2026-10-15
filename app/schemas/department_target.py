@@ -81,3 +81,25 @@ class WidgetUpdate(BaseModel):
 
 class WidgetOrder(BaseModel):
     ids: List[int] = Field(..., max_length=100)
+
+
+class MonthlyTargetCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    kind: WIDGET_KINDS = "number"
+    unit: Optional[str] = Field(None, max_length=30)
+    target: float = 0
+    current: float = 0
+    due_date: str = Field(..., pattern=DATE_PATTERN)
+    department_id: Optional[int] = None
+    note: Optional[str] = Field(None, max_length=1000)
+
+
+class MonthlyTargetUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    kind: Optional[WIDGET_KINDS] = None
+    unit: Optional[str] = Field(None, max_length=30)
+    target: Optional[float] = None
+    current: Optional[float] = None
+    due_date: Optional[str] = Field(None, pattern=DATE_PATTERN)
+    department_id: Optional[int] = None
+    note: Optional[str] = Field(None, max_length=1000)

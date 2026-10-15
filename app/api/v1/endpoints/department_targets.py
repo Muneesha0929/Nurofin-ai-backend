@@ -7,7 +7,8 @@ Who can do what:
 - HOD of a department: read the message, add / edit / delete that department's objectives.
 - Owner of an objective: update its status and progress.
 - Director, HOD, owner and department members: post updates on an objective.
-- Everyone signed in: read.
+- HOD and members: read their own departments. Other departments are not visible to them.
+- Everyone signed in: the company line, the overall progress, company and monthly targets.
 """
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional
@@ -24,6 +25,7 @@ from app.models.department_target import (
     CompanyQuarterGoal,
     CompanyWidget,
     DepartmentObjective,
+    MonthlyTarget,
     DepartmentObjectiveUpdate,
     DepartmentQuarterTarget,
     TargetDepartment,
@@ -36,6 +38,8 @@ from app.schemas.department_target import (
     DepartmentUpdate,
     ObjectiveCreate,
     ObjectiveUpdate,
+    MonthlyTargetCreate,
+    MonthlyTargetUpdate,
     ObjectiveUpdatePost,
     WidgetCreate,
     WidgetOrder,
@@ -125,6 +129,16 @@ async def load_users(db: AsyncSession, ids: List[int]) -> List[User]:
     if len(users) != len(ids):
         raise HTTPException(status_code=400, detail="One or more people were not found.")
     return list(users)
+
+
+def can_see(user: User, dept: TargetDepartment) -> bool:
+    """Departments are private: the Director sees all, everyone else only the ones they head or belong to."""
+    return is_director(user) or dept.hod_id == user.id or any(m.id == user.id for m in dept.members)
+
+
+def require_see(user: User, dept: TargetDepartment) -> None:
+    if not can_see(user, dept):
+        raise HTTPException(status_code=403, detail="You are not part of this department.")
 
 
 def can_plan(user: User, dept: TargetDepartment) -> bool:
@@ -299,7 +313,9 @@ async def overview(
         unread = d.hod_id == current_user.id and is_unread_for_hod(t)
         if unread:
             new_targets.append({"department_id": d.id, "department_name": d.name, "objectives": stats["objectives"]})
-        departments.append({**dept_payload(d), **target_payload(t), **stats, "new_for_me": unread})
+        # totals and progress above stay company-wide; the department cards are only for people in them
+        if can_see(current_user, d):
+            departments.append({**dept_payload(d), **target_payload(t), **stats, "new_for_me": unread})
 
     widgets = (await db.execute(
         select(CompanyWidget).filter(CompanyWidget.fiscal_year == fy, CompanyWidget.quarter_number == q, CompanyWidget.is_deleted == False)
@@ -311,9 +327,11 @@ async def overview(
         "quarter": quarter_info(fy, q),
         "headline": goal.headline if goal else None,
         "widgets": [widget_payload(w, names) for w in widgets],
+        "monthly_targets": [monthly_payload(m, names, current_user, depts) for m in await monthly_list(db)],
         "progress": round(sum(progress_values) / len(progress_values), 1) if progress_values else None,
         "totals": totals,
         "departments": departments,
+        "department_count": len(depts),
         "new_targets_for_me": new_targets,
         "can_edit": is_director(current_user),
     }, message="Quarter overview fetched")
@@ -355,7 +373,7 @@ async def list_departments(
         .filter(TargetDepartment.is_deleted == False)
         .order_by(TargetDepartment.name)
     )).scalars().all()
-    return success_response(data=[dept_payload(d) for d in depts], message="Departments fetched")
+    return success_response(data=[dept_payload(d) for d in depts if can_see(current_user, d)], message="Departments fetched")
 
 
 @router.post("/departments", response_model=APIResponse)
@@ -454,6 +472,7 @@ async def department_detail(
 ) -> Any:
     """One department with all four quarters of a financial year (default: the current FY)."""
     dept = await get_department(db, dept_id)
+    require_see(current_user, dept)
     fy = fiscal_year or current_quarter()[0]
     check_quarter(fy, 1)
     today = date.today().isoformat()
@@ -717,6 +736,7 @@ async def objective_detail(
     """One objective for the side panel: where it sits, its sub-objectives and its updates."""
     o = await get_objective(db, obj_id)
     dept = await get_department(db, o.department_id)
+    require_see(current_user, dept)
     today = date.today().isoformat()
     family = [x for x in await objectives_for(db, [dept.id], o.fiscal_year, o.quarter_number) if x.id == o.id or x.parent_id == o.id]
     node = build_tree(family, today, root_ids=[o.id])[0]
@@ -930,7 +950,7 @@ async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User
     from app.db.session import engine
 
     tables = ["cos_department", "cos_department_member", "cos_company_goal", "cos_quarter_target",
-              "cos_objective", "cos_objective_update", "cos_company_widget"]
+              "cos_objective", "cos_objective_update", "cos_company_widget", "cos_monthly_target"]
     report: Dict[str, Any] = {"tables": {}, "write_test": None}
 
     def inspect_tables(sync_conn):
@@ -967,6 +987,8 @@ async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User
             await conn.execute(md["cos_objective_update"].insert().values(objective_id=oid, user_id=current_user.id, text="x", is_deleted=False))
             step = "company widget"
             await conn.execute(md["cos_company_widget"].insert().values(fiscal_year=2000, quarter_number=1, title="x", kind="money", is_deleted=False))
+            step = "monthly target"
+            await conn.execute(md["cos_monthly_target"].insert().values(title="x", kind="number", target=1, current=0, due_date="2000-04-30", department_id=dep_id, is_deleted=False))
             report["write_test"] = {"ok": True}
         except Exception as e:
             report["write_test"] = {"ok": False, "failed_at": step, "error": f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"}
@@ -975,3 +997,87 @@ async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User
 
     report["ok"] = all(t["ok"] for t in report["tables"].values()) and report["write_test"]["ok"]
     return success_response(data=report, message="Self-check finished")
+
+
+# ----------------------------------------------------------------- monthly targets (right side of the Overview)
+
+async def monthly_list(db: AsyncSession) -> List[MonthlyTarget]:
+    return list((await db.execute(
+        select(MonthlyTarget).filter(MonthlyTarget.is_deleted == False).order_by(MonthlyTarget.due_date, MonthlyTarget.sort_order, MonthlyTarget.id)
+    )).scalars().all())
+
+
+def monthly_payload(m: MonthlyTarget, dept_names: Dict[int, str], user: User, depts: List[TargetDepartment]) -> Dict[str, Any]:
+    if m.kind == "milestone":
+        progress = 100.0 if (m.current or 0) >= 1 else 0.0
+    else:
+        progress = max(0.0, min(100.0, (m.current or 0) / m.target * 100)) if m.target else 0.0
+    dept = next((d for d in depts if d.id == m.department_id), None)
+    can_update = is_director(user) or bool(dept and dept.hod_id == user.id)
+    return {
+        "id": m.id, "title": m.title, "kind": m.kind or "number", "unit": m.unit,
+        "target": m.target or 0, "current": m.current or 0, "due_date": m.due_date, "note": m.note,
+        "progress": round(progress, 1),
+        "overdue": m.due_date < date.today().isoformat() and progress < 100,
+        "department": {"id": m.department_id, "name": dept_names.get(m.department_id)} if m.department_id else None,
+        "can_update": can_update,
+    }
+
+
+async def all_depts(db: AsyncSession) -> List[TargetDepartment]:
+    return list((await db.execute(select(TargetDepartment).filter(TargetDepartment.is_deleted == False))).scalars().all())
+
+
+async def get_monthly(db: AsyncSession, mid: int) -> MonthlyTarget:
+    m = (await db.execute(select(MonthlyTarget).filter(MonthlyTarget.id == mid, MonthlyTarget.is_deleted == False))).scalars().first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Target not found.")
+    return m
+
+
+@router.get("/monthly-targets", response_model=APIResponse)
+async def list_monthly_targets(db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    depts = await all_depts(db)
+    names = {d.id: d.name for d in depts}
+    return success_response(data=[monthly_payload(m, names, current_user, depts) for m in await monthly_list(db)], message="Monthly targets fetched")
+
+
+@router.post("/monthly-targets", response_model=APIResponse)
+async def create_monthly_target(m_in: MonthlyTargetCreate, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    if m_in.department_id:
+        await get_department(db, m_in.department_id)
+    m = MonthlyTarget(**m_in.model_dump(), updated_by_id=current_user.id)
+    m.title = m.title.strip()
+    db.add(m)
+    await db.commit()
+    depts = await all_depts(db)
+    return success_response(data=monthly_payload(m, {d.id: d.name for d in depts}, current_user, depts), message="Target added")
+
+
+@router.put("/monthly-targets/{mid}", response_model=APIResponse)
+async def update_monthly_target(mid: int, m_in: MonthlyTargetUpdate, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    """The Director can change anything. The responsible department's HOD can update the current value only."""
+    m = await get_monthly(db, mid)
+    data = m_in.model_dump(exclude_unset=True)
+    if not is_director(current_user):
+        dept = await get_department(db, m.department_id) if m.department_id else None
+        if not (dept and dept.hod_id == current_user.id and set(data) <= {"current"}):
+            raise HTTPException(status_code=403, detail="Only the Director, or the HOD of the responsible department (current value only), can change this.")
+    if data.get("department_id"):
+        await get_department(db, data["department_id"])
+    for k, v in data.items():
+        setattr(m, k, v.strip() if k == "title" and isinstance(v, str) else v)
+    m.updated_by_id = current_user.id
+    await db.commit()
+    depts = await all_depts(db)
+    return success_response(data=monthly_payload(m, {d.id: d.name for d in depts}, current_user, depts), message="Target saved")
+
+
+@router.delete("/monthly-targets/{mid}", response_model=APIResponse)
+async def delete_monthly_target(mid: int, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    require_director(current_user)
+    m = await get_monthly(db, mid)
+    m.is_deleted = True
+    await db.commit()
+    return success_response(message="Target deleted")
