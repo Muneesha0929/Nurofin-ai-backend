@@ -33,6 +33,8 @@ from app.models.department_target import (
 )
 from app.models.notification import Notification, NotificationTypeEnum
 from app.models.task import Task
+from app.models.quarter import Quarter, QuarterStatusEnum
+from sqlalchemy import update as sa_update
 from app.models.user import User
 from app.schemas.department_target import (
     CompanyGoalUpdate,
@@ -301,6 +303,32 @@ async def tasks_for(db: AsyncSession, objective_ids: List[int]) -> Dict[int, Lis
             "assignee": user_brief(people.get(uid)),
         })
     return out
+
+
+async def task_quarter_id(db: AsyncSession, fy: int, q: int, create: bool = False) -> Optional[int]:
+    """The Task Center keeps its own quarter rows (the Q1 / Q2 tabs). Find the one for this fiscal
+    quarter: first by date range (how the Task Center itself files tasks), then by year + number.
+    With create=True a missing quarter is added in the Task Center's naming style ("FY27 - Q3")."""
+    info = quarter_info(fy, q)
+    mid = f"{info['start'][:8]}15"
+    found = (await db.execute(select(Quarter).filter(
+        Quarter.is_deleted == False, Quarter.start_date != None, Quarter.end_date != None,
+        Quarter.start_date <= mid, Quarter.end_date >= mid,
+    ).order_by(Quarter.id))).scalars().first()
+    if not found:
+        found = (await db.execute(select(Quarter).filter(
+            Quarter.is_deleted == False, Quarter.fiscal_year == fy, Quarter.quarter_number == q,
+        ).order_by(Quarter.id))).scalars().first()
+    if found or not create:
+        return found.id if found else None
+    new = Quarter(
+        name=f"FY{(fy + 1) % 100:02d} - Q{q}", label=info["label"], fiscal_year=fy, quarter_number=q,
+        start_date=info["start"], end_date=info["end"],
+        status=QuarterStatusEnum.active if info["status"] == "current" else QuarterStatusEnum.planning,
+    )
+    db.add(new)
+    await db.flush()
+    return new.id
 
 
 # ----------------------------------------------------------------- overview
@@ -1152,6 +1180,7 @@ async def linkable_objectives(
     objs = await objectives_for(db, [d.id for d in depts], fy, q)
     names = {d.id: d.name for d in depts}
     titles = {o.id: o.title for o in objs}
+    tq = await task_quarter_id(db, fy, q)
     order = sorted(objs, key=lambda o: (names.get(o.department_id, ""), o.parent_id or o.id, o.parent_id is not None, o.sort_order or 0, o.id))
     return success_response(data={
         "quarter": quarter_info(fy, q),
@@ -1159,6 +1188,7 @@ async def linkable_objectives(
             "id": o.id, "title": o.title, "level": "sub_objective" if o.parent_id else "objective",
             "parent_title": titles.get(o.parent_id) if o.parent_id else None,
             "department": {"id": o.department_id, "name": names.get(o.department_id)},
+            "task_quarter_id": tq,
         } for o in order],
     }, message="Objectives fetched")
 
@@ -1218,6 +1248,10 @@ async def link_task(
     task = await _task_or_404(db, link_in.task_id)
     if not (can_plan(current_user, dept) or current_user.id in (task.assigned_to_id, task.assigned_by_id)):
         raise HTTPException(status_code=403, detail="You can only link tasks you created or that are assigned to you.")
+    # a task linked to a Q3 objective is a Q3 task in the Task Center too (only quarter_id is touched)
+    tq = await task_quarter_id(db, o.fiscal_year, o.quarter_number, create=True)
+    if tq:
+        await db.execute(sa_update(Task).where(Task.id == link_in.task_id).values(quarter_id=tq))
     existing = (await db.execute(select(ObjectiveTask).filter(ObjectiveTask.task_id == link_in.task_id))).scalars().first()
     if existing:
         existing.objective_id = o.id
@@ -1246,3 +1280,14 @@ async def unlink_task(
     link.is_deleted = True
     await db.commit()
     return success_response(message="Task unlinked")
+
+
+@router.post("/task-quarters/current", response_model=APIResponse)
+async def ensure_current_task_quarter(db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)) -> Any:
+    """Called when the Task Center opens: makes sure it has a tab for the quarter we are in."""
+    fy, q = current_quarter()
+    before = await task_quarter_id(db, fy, q)
+    qid = before or await task_quarter_id(db, fy, q, create=True)
+    if not before:
+        await db.commit()
+    return success_response(data={"id": qid, "created": not before, "label": quarter_info(fy, q)["label"]}, message="Quarter ready")
