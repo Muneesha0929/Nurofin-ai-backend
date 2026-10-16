@@ -103,3 +103,7 @@ class MonthlyTargetUpdate(BaseModel):
     due_date: Optional[str] = Field(None, pattern=DATE_PATTERN)
     department_id: Optional[int] = None
     note: Optional[str] = Field(None, max_length=1000)
+
+
+class TaskLink(BaseModel):
+    task_id: int

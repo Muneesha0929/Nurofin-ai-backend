@@ -134,3 +134,14 @@ class MonthlyTarget(Base):
     note = Column(Text, nullable=True)
     sort_order = Column(Integer, default=0)
     updated_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
+
+
+class ObjectiveTask(Base):
+    """Links a Task Center task to one objective or sub-objective. The task table itself is not changed."""
+    __tablename__ = "cos_objective_task"
+    __table_args__ = (UniqueConstraint("task_id", name="uix_cos_objective_task_task"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    objective_id = Column(Integer, ForeignKey("cos_objective.id"), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey("task.id"), nullable=False)
+    linked_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
