@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_NAME: str = ""
     
     DATABASE_URL: str | None = None
+
+    # Runway (CEO-only cash forecast). Empty = every account with the "ceo" role.
+    RUNWAY_ALLOWED_EMAILS: str = ""
+    # Local testing only: pretend today is this date (YYYY-MM-DD). Never set in production.
+    RUNWAY_TODAY: str = ""
     
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:

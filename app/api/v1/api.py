@@ -38,3 +38,5 @@ from app.api.v1.endpoints import targets
 api_router.include_router(targets.router, prefix="/targets", tags=["targets"])
 from app.api.v1.endpoints import department_targets
 api_router.include_router(department_targets.router, prefix="/department-targets", tags=["department-targets"])
+from app.api.v1.endpoints import runway
+api_router.include_router(runway.router, prefix="/runway", tags=["runway"])

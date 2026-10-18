@@ -32,3 +32,4 @@ from .target import Target
 from .target_permission import TargetPermission
 from .target_score import TargetScore
 from .department_target import TargetDepartment, CompanyQuarterGoal, DepartmentQuarterTarget, DepartmentObjective, DepartmentObjectiveUpdate, CompanyWidget, MonthlyTarget, ObjectiveTask, target_department_members
+from .runway import RunwaySettings, ExpenseCategory, Expense, ExpenseMonth, Product, ProductFigure, ProductMonth, CapitalEntry, BankCheck
