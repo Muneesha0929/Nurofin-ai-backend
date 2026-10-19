@@ -11,6 +11,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -28,6 +30,7 @@ from app.schemas.runway import (
     ProductIn, ProductMonthIn, SettingsIn, MONTH,
 )
 from app.services import runway_forecast as rf
+from app.services import runway_import as ri
 
 router = APIRouter()
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -474,3 +477,109 @@ async def restore(kind: str, rid: int, db: AsyncSession = Depends(deps.get_db), 
     row.is_deleted = False
     await db.commit()
     return success_response(data=await everything(db), message="Restored")
+
+
+# ----------------------------------------------------------------- bulk upload (CSV)
+
+class ImportIn(BaseModel):
+    csv: str = Field(..., max_length=ri.MAX_BYTES)
+    replace: bool = True   # cells that already have a different figure take the file's figure
+
+
+@router.get("/template/{kind}")
+async def download_template(kind: str, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    """CSV template, pre-filled with what Runway already has (so re-uploading it changes nothing)."""
+    data = await load(db)
+    if kind == "monthly":
+        text, name = ri.template_monthly(data, today()), "runway-monthly-history.csv"
+    elif kind == "figures":
+        text, name = ri.template_figures(data), "runway-product-figures.csv"
+    else:
+        raise HTTPException(status_code=404, detail="Unknown template.")
+    # BOM so Excel opens ₹ and names correctly
+    return Response(content="\ufeff" + text, media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+@router.post("/import/preview", response_model=APIResponse)
+async def import_preview(body: ImportIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    plan = ri.parse(body.csv, await load(db), today())
+    return success_response(data={k: plan[k] for k in ("kind", "errors", "warnings", "categories", "expenses", "products", "summary") if k in plan})
+
+
+@router.post("/import/apply", response_model=APIResponse)
+async def import_apply(body: ImportIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    data = await load(db)
+    plan = ri.parse(body.csv, data, today())
+    if plan["errors"]:
+        raise HTTPException(status_code=400, detail=f"The file has {len(plan['errors'])} problem(s); fix them and upload again.")
+    s = await get_settings(db)
+    counts = {"added": 0, "changed": 0, "kept": 0}
+
+    cat_ids = {c["name"].strip().lower(): c["id"] for c in data["categories"]}
+    for name in plan["categories"]:
+        c = ExpenseCategory(name=name, sort_order=len(cat_ids))
+        db.add(c); await db.flush()
+        cat_ids[name.lower()] = c.id
+    exp_ids = {e["name"].strip().lower(): e["id"] for e in data["expenses"]}
+    for e in plan["expenses"]:
+        row = Expense(category_id=cat_ids[e["category"].lower()], name=e["name"], how=e["how"], amount=e["amount"],
+                      start_month=e["start_month"] or s.start_month, end_month=e["end_month"], raise_pct=e["raise_pct"])
+        db.add(row); await db.flush()
+        exp_ids[e["name"].lower()] = row.id
+    prod = {p["name"].strip().lower(): p["id"] for p in data["products"]}
+    for p in plan["products"]:
+        row = Product(name=p["name"], tracking="figures", cost_label=p["cost_label"], amount=0, start_month=p["start_month"],
+                      sort_order=len(prod))
+        db.add(row); await db.flush()
+        prod[p["name"].lower()] = row.id
+    for pname, label in (plan.get("product_labels") or {}).items():
+        row = await get_or_404(db, Product, prod[pname.lower()], "Product")
+        row.cost_label = label
+
+    def decide(c) -> bool:
+        if c["old"] is None:
+            counts["added"] += 1; return True
+        same = abs(float(c["old"]) - float(c["amount"])) < .005 and (c.get("cost") is None or c.get("old_cost") is None or abs(float(c["old_cost"]) - float(c["cost"])) < .005)
+        if same or not body.replace:
+            counts["kept"] += 1; return False
+        counts["changed"] += 1; return True
+
+    capital = await alive(db, CapitalEntry)
+    figs = await alive(db, ProductFigure)
+    for c in plan["cells"]:
+        if not decide(c):
+            continue
+        t = c["target"]
+        if t == "expense":
+            await set_month(db, exp_ids[c["name"].lower()], c["month"], c["amount"])
+        elif t == "product_month":
+            pid = prod[c["name"].lower()]
+            row = (await db.execute(select(ProductMonth).filter(ProductMonth.product_id == pid, ProductMonth.month == c["month"]))).scalars().first()
+            cost = c.get("cost")
+            if cost is None:
+                cost = c.get("old_cost")
+            if cost is None:
+                ratio = await usual_cost_ratio(db, pid)
+                cost = round(c["amount"] * ratio, 2) if ratio is not None else 0
+            if row:
+                row.revenue, row.cost, row.is_deleted = c["amount"], cost, False
+            else:
+                db.add(ProductMonth(product_id=pid, month=c["month"], revenue=c["amount"], cost=cost))
+        elif t == "capital":
+            row = next((x for x in capital if x.day[:7] == c["month"] and (x.note or "Capital").strip().lower() == c["name"].lower()), None)
+            if row:
+                row.amount = c["amount"]
+            else:
+                db.add(CapitalEntry(day=f"{c['month']}-01", amount=c["amount"], note=c["name"]))
+        elif t == "figure":
+            pid = prod[c["name"].lower()]
+            row = next((f for f in figs if f.product_id == pid and f.day == c["day"]), None)
+            if row:
+                row.revenue, row.cost, row.forecast = c["amount"], c.get("cost") if c.get("cost") is not None else row.cost, c.get("forecast") if c.get("forecast") is not None else row.forecast
+            else:
+                db.add(ProductFigure(product_id=pid, day=c["day"], revenue=c["amount"], cost=c.get("cost"), forecast=c.get("forecast")))
+        await db.flush()
+    await db.commit()
+    return success_response(data=await everything(db) | {"imported": counts | {
+        "categories": len(plan["categories"]), "expenses": len(plan["expenses"]), "products": len(plan["products"])}}, message="Imported")
