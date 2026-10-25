@@ -1291,3 +1291,54 @@ async def ensure_current_task_quarter(db: AsyncSession = Depends(deps.get_db), c
     if not before:
         await db.commit()
     return success_response(data={"id": qid, "created": not before, "label": quarter_info(fy, q)["label"]}, message="Quarter ready")
+
+
+# ----------------------------------------------------------------- Task Center "Objectives" tab
+
+@router.get("/board", response_model=APIResponse)
+async def objectives_board(
+    fiscal_year: Optional[int] = Query(None),
+    quarter: Optional[int] = Query(None),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Every department the caller can see, each with its objectives and their tasks (sub-objectives)
+    for one quarter. Read-only view of the same data the Departments page uses."""
+    fy, q = (fiscal_year, quarter) if fiscal_year and quarter else current_quarter()
+    check_quarter(fy, q)
+    today = date.today().isoformat()
+    depts = [d for d in (await db.execute(
+        select(TargetDepartment)
+        .options(selectinload(TargetDepartment.hod), selectinload(TargetDepartment.members))
+        .filter(TargetDepartment.is_deleted == False)
+        .order_by(TargetDepartment.name)
+    )).scalars().all() if can_see(current_user, d)]
+    ids = [d.id for d in depts]
+    objs = await objectives_for(db, ids, fy, q)
+    linked = await tasks_for(db, [o.id for o in objs])
+    targets = {
+        t.department_id: t
+        for t in (await db.execute(select(DepartmentQuarterTarget).filter(
+            DepartmentQuarterTarget.department_id.in_(ids or [0]),
+            DepartmentQuarterTarget.fiscal_year == fy,
+            DepartmentQuarterTarget.quarter_number == q,
+            DepartmentQuarterTarget.is_deleted == False,
+        ))).scalars().all()
+    }
+    out = []
+    for d in depts:
+        tree = build_tree([o for o in objs if o.department_id == d.id], today, tasks=linked)
+        t = targets.get(d.id)
+        out.append({
+            **dept_payload(d),
+            "message": t.message if t else None,
+            **summarize(tree),
+            "objectives_tree": tree,
+            "can_plan": can_plan(current_user, d),
+        })
+    return success_response(data={
+        "quarter": quarter_info(fy, q),
+        "departments": out,
+        "me": current_user.id,
+        "is_director": is_director(current_user),
+    }, message="Objectives board fetched")
