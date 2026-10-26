@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
@@ -14,10 +14,11 @@ class TargetCreate(TargetBase):
 class TargetUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
+    month: Optional[str] = None
     is_completed: Optional[bool] = None
 
 class TargetScoreUpdate(BaseModel):
-    score: float
+    score: float = Field(..., ge=0, le=100)
 
 class ReviewerScore(BaseModel):
     reviewer_id: int

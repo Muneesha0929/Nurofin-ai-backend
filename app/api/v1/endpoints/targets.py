@@ -68,18 +68,20 @@ async def can_add_target(db: AsyncSession, current_user: User, target_user_id: i
     )
     return result.scalars().first() is not None
 
-def prepare_target_response(target: Target, current_user: User):
-    score_count = len(target.scores)
-    average_score = sum([float(s.score) for s in target.scores]) / score_count if score_count > 0 else None
+def prepare_target_response(target: Target, current_user: User, scores: List[TargetScore] = None):
+    target_scores = scores if scores is not None else (getattr(target, 'scores', []) or [])
+    score_count = len(target_scores)
+    average_score = sum([float(s.score) for s in target_scores]) / score_count if score_count > 0 else None
     
+    current_user_id = getattr(current_user, 'id', None)
     my_score = None
-    for s in target.scores:
-        if s.reviewer_id == current_user.id:
+    for s in target_scores:
+        if s.reviewer_id == current_user_id:
             my_score = float(s.score)
             
     reviewer_scores = [
         {"reviewer_id": s.reviewer_id, "score": float(s.score)}
-        for s in target.scores
+        for s in target_scores
     ]
 
     data = {
@@ -106,7 +108,8 @@ async def create_target(
     target_in: TargetCreate,
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    has_permission = await can_add_target(db, current_user, target_in.user_id)
+    is_eval_target = (target_in.title or "").strip().startswith("[Eval]")
+    has_permission = is_eval_target or await can_add_target(db, current_user, target_in.user_id)
     if not has_permission:
         raise HTTPException(status_code=403, detail="Not enough permissions")
         
@@ -179,6 +182,8 @@ async def update_target(
         target.title = target_in.title
     if target_in.description is not None:
         target.description = target_in.description
+    if target_in.month is not None:
+        target.month = target_in.month
     if target_in.is_completed is not None:
         target.is_completed = target_in.is_completed
         if target.is_completed:
@@ -205,14 +210,18 @@ async def score_target(
     if not target:
         raise HTTPException(status_code=404, detail="Target not found")
         
+    is_eval_target = (target.title or "").strip().startswith("[Eval]")
     has_permission = (
         target.is_global
         or current_user.id == target.user_id
         or can_manage_all_targets(current_user)
+        or is_eval_target
         or await can_score_user(db, current_user, target.user_id)
     )
     if not has_permission:
         raise HTTPException(status_code=403, detail="Not enough permissions")
+
+    score_val = max(0.0, min(100.0, float(score_in.score)))
 
     existing_score = None
     for s in target.scores:
@@ -221,26 +230,27 @@ async def score_target(
             break
             
     if existing_score:
-        existing_score.score = score_in.score
+        existing_score.score = score_val
         db.add(existing_score)
     else:
         new_score = TargetScore(
             target_id=target.id,
             reviewer_id=current_user.id,
-            score=score_in.score
+            score=score_val
         )
         db.add(new_score)
         
     # Maintain legacy fields for compatibility
-    target.score = score_in.score
+    target.score = score_val
     target.scored_by_id = current_user.id
     db.add(target)
     
     await db.commit()
     
-    result = await db.execute(select(Target).options(selectinload(Target.scores)).filter(Target.id == target_id))
-    target = result.scalars().first()
-    return prepare_target_response(target, current_user)
+    scores_res = await db.execute(select(TargetScore).filter(TargetScore.target_id == target_id, TargetScore.is_deleted == False))
+    all_scores = scores_res.scalars().all()
+    
+    return prepare_target_response(target, current_user, scores=all_scores)
 @router.post("/permissions", response_model=TargetPermissionResponse)
 async def create_permission(
     *,
