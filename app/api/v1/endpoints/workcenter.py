@@ -276,7 +276,7 @@ async def read_tasks(
     total = (await db.execute(count_q)).scalar() or 0
     result = await db.execute(q.order_by(Task.created_at.desc()).offset((page - 1) * page_size).limit(page_size))
     tasks = result.scalars().all()
-    cache = {'users': {}, 'projects': {}, 'max_subtask_depth': 1}
+    cache = {'users': {}, 'projects': {}, 'max_subtask_depth': 5}
 
     # Batch-load the latest "assigned" history entry per parent task in a single query
     top_ids = [t.id for t in tasks if t.parent_id is None]
@@ -465,6 +465,8 @@ async def create_task(
                 actual_deadline = parent.deadline
             if not actual_quarter_id:
                 actual_quarter_id = parent.quarter_id
+            if not actual_project_id:
+                actual_project_id = parent.project_id
                 
     if not actual_quarter_id:
         actual_quarter_id = await _determine_quarter_id(db, actual_deadline or actual_start_date)

@@ -25,6 +25,7 @@ class TaskBase(BaseModel):
     pushed_to_next_day: Optional[bool] = False
     actual_completion_date: Optional[Union[datetime, str]] = None
     idempotency_key: Optional[str] = None
+    created_at: Optional[Union[datetime, str]] = None
 
 class TaskCreate(TaskBase):
     title: str

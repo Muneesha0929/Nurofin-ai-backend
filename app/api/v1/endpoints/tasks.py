@@ -213,6 +213,16 @@ async def create_task(
             quarter = q_res.scalars().first()
             if quarter:
                 quarter_id = quarter.id
+
+        parent_id = task_data.get("parent_id")
+        if parent_id:
+            parent_r = await db.execute(select(Task).filter(Task.id == parent_id, Task.is_deleted == False))
+            parent_task = parent_r.scalars().first()
+            if parent_task:
+                if not task_data.get("project_id") and parent_task.project_id:
+                    task_data["project_id"] = parent_task.project_id
+                if not quarter_id and parent_task.quarter_id:
+                    quarter_id = parent_task.quarter_id
                 
         db_task = Task(**task_data, assigned_by_id=current_user.id, quarter_id=quarter_id)
         db.add(db_task)
@@ -235,6 +245,12 @@ async def create_task(
         # Recalculate project progress
         if db_task.project_id:
             await update_project_progress(db, db_task.project_id)
+        if db_task.parent_id:
+            try:
+                from app.api.v1.endpoints.workcenter import _recalculate_parent_progress
+                await _recalculate_parent_progress(db, db_task.parent_id)
+            except Exception:
+                pass
             
         # Reload with relationships
         res = await db.execute(select(Task).options(selectinload(Task.assigned_to), selectinload(Task.assigned_by)).filter(Task.id == db_task.id))
