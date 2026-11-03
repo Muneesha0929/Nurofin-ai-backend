@@ -171,7 +171,10 @@ def expense_value(e: Dict[str, Any], m: str, cur: str, last: str, fits: Dict[int
     if m in e["months"]:
         return e["months"][m]
     if m < cur:
-        return 0.0  # not entered: counted as nothing and flagged on the page
+        # "Every month, same amount" means exactly that, past months included, unless a month
+        # was entered differently. Only lines whose amount changes need each month typed in;
+        # until then they count as nothing and are flagged on the page.
+        return e["amount"] if e["how"] == "monthly" and expense_active(e, m) else 0.0
     return expense_planned(e, m, cur, last, fits)
 
 
@@ -295,7 +298,7 @@ def build(data: Dict[str, Any], today: date) -> Dict[str, Any]:
 
     # ---- things that need the CEO
     todo = []
-    missing = [e["name"] for e in data["expenses"] if e["how"] != "once" and expense_active(e, last) and last not in e["months"]] if hist else []
+    missing = [e["name"] for e in data["expenses"] if e["how"] == "varies" and expense_active(e, last) and last not in e["months"]] if hist else []
     if missing:
         todo.append({"kind": "expenses_missing", "month": last, "names": missing})
     for p, po in zip(data["products"], prods_out):

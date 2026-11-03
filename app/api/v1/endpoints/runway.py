@@ -220,6 +220,7 @@ async def set_month(db: AsyncSession, expense_id: int, month: str, amount: Optio
 async def apply_expense(db: AsyncSession, e: Expense, body: ExpenseIn, is_new: bool) -> None:
     s = await get_settings(db)
     cur = cur_month()
+    before = None if is_new else (e.how, float(e.amount or 0), e.start_month, e.end_month)
     category_id = await resolve_category(db, body)   # queries first: a pending new row must not autoflush half-filled
     e.name, e.how, e.category_id = body.name.strip(), body.how, category_id
     if is_new:
@@ -236,6 +237,16 @@ async def apply_expense(db: AsyncSession, e: Expense, body: ExpenseIn, is_new: b
     start = body.start_month or cur
     if body.end_month and body.end_month < start:
         raise HTTPException(status_code=400, detail="The end month is before the start month.")
+    if before and before[0] == "monthly" and abs(before[1] - body.amount) > .005:
+        # past months of a same-every-month line count its amount; when the amount changes,
+        # write the old amount into the past months first so history stays what was really paid
+        last = rf.add_m(cur, -1)
+        end = min(before[3] or last, last)
+        if before[2] <= end:
+            have = {r.month for r in await alive(db, ExpenseMonth, ExpenseMonth.expense_id == e.id)}
+            for m in rf.m_range(before[2], end):
+                if m not in have:
+                    db.add(ExpenseMonth(expense_id=e.id, month=m, amount=before[1]))
     e.amount, e.start_month, e.end_month = body.amount, start, body.end_month
     e.raise_pct = body.raise_pct if body.how == "monthly" else 0
     await db.flush()

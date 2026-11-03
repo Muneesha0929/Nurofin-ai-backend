@@ -122,3 +122,16 @@ def test_no_data_yet_does_not_crash():
          "amount": 0, "start": "2025-12", "end": None, "figures": [], "months": {}}], "capital": [], "bank": None}
     s = rf.build(d, TODAY)
     assert s["now"]["cost"] == 0 and s["state"] == "self_funding"
+
+
+def test_same_every_month_counts_past_months_without_typing_each_one():
+    d = sample()
+    d["expenses"].append({"id": 99, "category_id": 2, "name": "New office rent", "how": "monthly", "amount": 50000,
+                          "start": "2026-01", "end": None, "raise": 0, "months": {"2026-03": 55000}})
+    base = rf.build(sample(), TODAY)
+    s = rf.build(d, TODAY)
+    diff = {m["month"]: round(m["cost"] - b["cost"]) for m, b in zip(s["months"], base["months"])}
+    assert diff["2025-12"] == 0                 # before it started
+    assert diff["2026-01"] == 50000 and diff["2026-09"] == 50000
+    assert diff["2026-03"] == 55000             # a month entered differently keeps its own figure
+    assert all("New office rent" not in t.get("names", []) for t in s["todo"])   # never "not entered"
