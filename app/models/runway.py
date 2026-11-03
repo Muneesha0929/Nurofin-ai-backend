@@ -75,7 +75,9 @@ class Product(Base):
                           whenever you look, and month totals when a month closes),
                'fixed'   (the same amount every month: a retainer, a subscription),
                'billed'  (billed once a month with client minimums, like GMDI: figures carry the
-                          product's own expected bill; see ProductClient).
+                          product's own expected bill; see ProductClient),
+               'once'    (only the months something is typed in: onboarding fees, set-up fees).
+    A ProductMonth in a future month is the plan for that month, for any tracking.
     cost_label names the cost that grows with this product's revenue ("Bank charges" for GMDI);
     leave it empty when there is none.
     """
@@ -83,7 +85,7 @@ class Product(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(120), nullable=False)
-    tracking = Column(String(10), nullable=False, default="figures")   # figures | fixed | billed
+    tracking = Column(String(10), nullable=False, default="figures")   # figures | fixed | billed | once
     cost_label = Column(String(80), nullable=True)
     amount = Column(MONEY, nullable=False, default=0)          # fixed products only
     start_month = Column(String(7), nullable=False)

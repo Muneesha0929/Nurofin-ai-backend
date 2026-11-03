@@ -35,7 +35,7 @@ class FillMonth(BaseModel):
 
 class ProductIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    tracking: Literal["figures", "fixed", "billed"]
+    tracking: Literal["figures", "fixed", "billed", "once"]
     cost_label: Optional[str] = Field(None, max_length=80)
     amount: float = Field(0, ge=0, le=1e12)
     start_month: str = Field(..., pattern=MONTH)
@@ -79,3 +79,25 @@ class SettingsIn(BaseModel):
     buffer_pct: Optional[float] = Field(None, ge=0, le=50)
     green_months: Optional[int] = Field(None, ge=1, le=60)
     amber_months: Optional[int] = Field(None, ge=1, le=60)
+
+
+# ----------------------------------------------------------------- the spreadsheet
+
+class CellIn(BaseModel):
+    row: str = Field(..., pattern=r"^(e:\d+|p:\d+|cap)$")   # e:<expense id>, p:<product id>, cap = money put in
+    month: str = Field(..., pattern=MONTH)
+    amount: Optional[float] = Field(None, ge=0, le=1e12)       # null clears the cell (back to the rule / forecast)
+
+
+class CellsIn(BaseModel):
+    changes: list[CellIn] = Field(..., min_length=1, max_length=2000)
+
+
+class FromMonthIn(BaseModel):
+    month: str = Field(..., pattern=MONTH)
+    amount: float = Field(..., ge=0, le=1e12)
+
+
+class RowIn(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=160)
+    category_id: Optional[int] = None
