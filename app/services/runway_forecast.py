@@ -126,8 +126,51 @@ def pace(month: str, figs: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def committed(p: Dict[str, Any], m: str) -> float:
+    """What a billed product's clients must pay for month m at the least: each client's minimum
+    monthly bill plus its fixed monthly charges, for clients live that month."""
+    return sum(c["minimum"] + (c.get("fixed") or 0.0) for c in p.get("clients", [])
+               if c["start"] <= m and (not c.get("end") or m <= c["end"]))
+
+
+def billed_month(p: Dict[str, Any], m: str, cur: str) -> Optional[Dict[str, Any]]:
+    """A billed-monthly product (GMDI) for a past or the current month.
+
+    The final invoice total wins. Otherwise the latest figure that month: the product's own
+    expected bill (GMDI's Profit Outlook, minimums already applied) is taken as it is; usage so far
+    alone is carried to the month end and lifted to the clients' committed minimum, since a client
+    below its minimum is billed the minimum.
+    """
+    f = p["months"].get(m)
+    if f:
+        return {"revenue": f["revenue"], "cost": f["cost"], "how": "final"}
+    figs = sorted([x for x in p["figures"] if x["day"][:7] == m], key=lambda x: x["day"])
+    if not figs:
+        return None
+    last = figs[-1]
+    floor = committed(p, m)
+    if last.get("forecast"):
+        bill = last["forecast"]
+        source = "product"
+        lo, hi = bill * .95, bill * 1.05
+    else:
+        usage = pace(m, [x for x in figs if x["revenue"]]) if any(x["revenue"] for x in figs) else None
+        bill = max(usage["value"] if usage else 0.0, floor)
+        lo, hi = max(usage["lo"] if usage else 0.0, floor), max(usage["hi"] if usage else 0.0, floor)
+        source = "usage"
+    cost = last["cost"] if last.get("cost") is not None else None
+    day = int(last["day"][8:])
+    cur_info = {"value": bill, "lo": lo, "hi": hi, "source": source, "committed": floor, "as_of": last["day"],
+                "day": day, "days": days_in(m), "so_far": last["revenue"] or 0.0, "product_forecast": last.get("forecast"),
+                "expected_cost": cost, "cost_ratio": (cost / bill) if cost is not None and bill else None}
+    return {"revenue": bill, "cost": cost if cost is not None else 0.0, "cost_known": cost is not None,
+            "how": "estimated" if m < cur else "so_far", "pace": cur_info}
+
+
 def product_month(p: Dict[str, Any], m: str, cur: str) -> Optional[Dict[str, Any]]:
     """A product's revenue and linked cost for a past or the current month."""
+    if p["tracking"] == "billed":
+        return billed_month(p, m, cur)
     if p["tracking"] == "fixed":
         if m < p["start"] or (p.get("end") and m > p["end"]):
             return None
@@ -191,54 +234,78 @@ def build(data: Dict[str, Any], today: date) -> Dict[str, Any]:
     fits: Dict[int, Fit] = {}
 
     # ---- products
+    # Each product gives, per billing month, its revenue (expected and the low/high range) and its
+    # linked cost. Revenue reaches the bank pay_delay months later (clients pay the bill after the
+    # month ends); the linked cost, like bank charges, is paid in the month itself.
     prods_out = []
-    p_by_month: Dict[str, Dict[str, Any]] = {m: {"rev": 0.0, "cost": 0.0, "lo": 0.0, "hi": 0.0, "costs": {}} for m in months}
+    p_by_month: Dict[str, Dict[str, Any]] = {m: {"rev": 0.0, "cost": 0.0, "lo": 0.0, "hi": 0.0, "cost_lo": 0.0, "costs": {}} for m in months}
     for p in data["products"]:
+        delay = int(p.get("pay_delay") or 0)
         actual = {m: product_month(p, m, cur) for m in hist + [cur]}
+        bill: Dict[str, Dict[str, float]] = {}
+        out: Dict[str, Any] = {"id": p["id"], "pay_delay": delay, "months": _product_rows(p, actual, hist), "cost_ratio": 0.0, "current": None}
         if p["tracking"] == "fixed":
             for m in months:
                 live = m >= p["start"] and (not p.get("end") or m <= p["end"])
                 r = (actual.get(m) or {}).get("revenue", p["amount"]) if live else 0.0
                 c = (actual.get(m) or {}).get("cost", 0.0) if live else 0.0
-                pm = p_by_month[m]
-                pm["rev"] += r; pm["lo"] += r; pm["hi"] += r; pm["cost"] += c
-            prods_out.append({"id": p["id"], "current": None, "months": _product_rows(p, actual, hist), "cost_ratio": 0.0})
-            continue
-        first = next((m for m in hist + [cur] if actual.get(m)), None)
-        series = [(actual.get(m) or {}).get("revenue", 0.0) for m in m_range(first, cur)] if first else []
-        fit = Fit(series or [0.0])
-        recent = [actual[m] for m in hist[-3:] if actual.get(m)]
-        rev3 = sum(a["revenue"] for a in recent)
-        ratio = (sum(a["cost"] for a in recent) / rev3) if rev3 else 0.0
-        if not recent and actual.get(cur) and actual[cur].get("pace", {}).get("cost_ratio") is not None:
-            ratio = actual[cur]["pace"]["cost_ratio"]
+                bill[m] = {"v": r, "lo": r, "hi": r, "cost": c, "cost_lo": c}
+        else:
+            billed = p["tracking"] == "billed"
+            first = next((m for m in hist + [cur] if actual.get(m)), None)
+            series = [(actual.get(m) or {}).get("revenue", 0.0) for m in m_range(first, cur)] if first else []
+            fit = Fit(series or [0.0])
+            recent = [actual[m] for m in hist[-3:] if actual.get(m) and actual[m].get("cost_known", True)]
+            rev3 = sum(x["revenue"] for x in recent)
+            ratio = (sum(x["cost"] for x in recent) / rev3) if rev3 else 0.0
+            if not recent and actual.get(cur) and (actual[cur].get("pace") or {}).get("cost_ratio") is not None:
+                ratio = actual[cur]["pace"]["cost_ratio"]
+            out["cost_ratio"] = ratio
+            for m in months:
+                live = m >= p["start"] and (not p.get("end") or m <= p["end"])
+                floor = committed(p, m) if billed else 0.0
+                if m < cur:
+                    x = actual.get(m)
+                    if x:
+                        c = x["cost"] if x.get("cost_known", True) else x["revenue"] * ratio
+                        bill[m] = {"v": x["revenue"], "lo": x["revenue"], "hi": x["revenue"], "cost": c, "cost_lo": c}
+                    continue
+                if not live or (not first and not floor):
+                    continue
+                if m == cur and actual.get(cur):
+                    pc = actual[cur]["pace"]; f = {"v": pc["value"], "lo": pc["lo"], "hi": pc["hi"]}
+                    known = (pc.get("expected_cost") if billed else None)
+                elif first:
+                    f = fit.at(m_idx(m) - m_idx(cur)); known = None
+                else:
+                    f = {"v": 0.0, "lo": 0.0, "hi": 0.0}; known = None
+                # a billed client never pays less than its minimum
+                f = {k: max(v, floor) for k, v in f.items()}
+                c = known if known is not None else f["v"] * ratio
+                bill[m] = {"v": f["v"], "lo": f["lo"], "hi": f["hi"], "cost": c, "cost_lo": known if known is not None else f["lo"] * ratio}
+            cur_a = actual.get(cur)
+            out.update({
+                "current": cur_a["pace"] if cur_a and cur_a.get("pace") else None,
+                "expected_this_month": (bill.get(cur) or {}).get("v"),
+                "fit": fit.params,
+            })
+            if billed:
+                out.update({"committed": committed(p, cur), "committed_next": committed(p, add_m(cur, 1)),
+                            "clients_live": sum(1 for c in p.get("clients", []) if c["start"] <= cur and (not c.get("end") or cur <= c["end"]))})
         for m in months:
-            pm = p_by_month[m]
-            if m < cur:
-                a = actual.get(m)
-                if a:
-                    pm["rev"] += a["revenue"]; pm["lo"] += a["revenue"]; pm["hi"] += a["revenue"]; pm["cost"] += a["cost"]
-                    pm["costs"][p["id"]] = a["cost"]
-                continue
-            if not first or m < p["start"] or (p.get("end") and m > p["end"]):
-                continue
-            if m == cur and actual.get(cur):
-                pc = actual[cur]["pace"]; f = {"v": pc["value"], "lo": pc["lo"], "hi": pc["hi"]}
-            else:
-                f = fit.at(m_idx(m) - m_idx(cur))
-            pm["rev"] += f["v"]; pm["lo"] += f["lo"]; pm["hi"] += f["hi"]
-            pm["cost"] += f["v"] * ratio
-            pm.setdefault("ratios", []).append((f["lo"], f["v"], ratio))
-            pm["costs"][p["id"]] = f["v"] * ratio
-        cur_a = actual.get(cur)
-        prods_out.append({
-            "id": p["id"],
-            "current": cur_a["pace"] if cur_a and cur_a.get("pace") else None,
-            "expected_this_month": (cur_a or {}).get("revenue") if cur_a else (fit.at(0)["v"] if first else None),
-            "months": _product_rows(p, actual, hist),
-            "cost_ratio": ratio,
-            "fit": fit.params,
-        })
+            b = bill.get(m)
+            if b:
+                pm = p_by_month[m]
+                pm["cost"] += b["cost"]; pm["cost_lo"] += b["cost_lo"]
+                if b["cost"]:
+                    pm["costs"][p["id"]] = b["cost"]
+            paid = bill.get(add_m(m, -delay)) if delay else b
+            if paid:
+                pm = p_by_month[m]
+                pm["rev"] += paid["v"]; pm["lo"] += paid["lo"]; pm["hi"] += paid["hi"]
+        out["paid_this_month"] = (bill.get(add_m(cur, -delay)) or {}).get("v", 0.0)
+        out["billed_this_month"] = (bill.get(cur) or {}).get("v", 0.0)
+        prods_out.append(out)
 
     # ---- expenses
     base: Dict[str, float] = {}
@@ -258,10 +325,8 @@ def build(data: Dict[str, Any], today: date) -> Dict[str, Any]:
             row = {"inc": pm["rev"], "cost": base[m] + pm["cost"]}
             cases["expected"][m] = row; cases["slower"][m] = dict(row)
             continue
-        slower_cost = sum(lo * r for lo, _, r in pm.get("ratios", []))
-        fixed_cost = pm["cost"] - sum(v * r for _, v, r in pm.get("ratios", []))
         cases["expected"][m] = {"inc": pm["rev"], "cost": base[m] * buf + pm["cost"]}
-        cases["slower"][m] = {"inc": pm["lo"], "cost": base[m] * (buf + .05) + slower_cost + fixed_cost}
+        cases["slower"][m] = {"inc": pm["lo"], "cost": base[m] * (buf + .05) + pm["cost_lo"]}
 
     def cap_by(m: str) -> float:
         return sum(c["amount"] for c in data["capital"] if c["day"][:7] <= m)
@@ -302,7 +367,7 @@ def build(data: Dict[str, Any], today: date) -> Dict[str, Any]:
     if missing:
         todo.append({"kind": "expenses_missing", "month": last, "names": missing})
     for p, po in zip(data["products"], prods_out):
-        if p["tracking"] != "figures":
+        if p["tracking"] == "fixed":
             continue
         for row in po["months"]:
             if row["how"] == "estimated":

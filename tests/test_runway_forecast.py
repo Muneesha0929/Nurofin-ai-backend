@@ -135,3 +135,58 @@ def test_same_every_month_counts_past_months_without_typing_each_one():
     assert diff["2026-01"] == 50000 and diff["2026-09"] == 50000
     assert diff["2026-03"] == 55000             # a month entered differently keeps its own figure
     assert all("New office rent" not in t.get("names", []) for t in s["todo"])   # never "not entered"
+
+
+# ---------------------------------------------------------------- billed monthly with minimums (GMDI)
+
+def billed_sample(delay=1):
+    d = sample()
+    g = d["products"][0]
+    g.update({"tracking": "billed", "pay_delay": delay, "clients": [
+        {"id": 1, "name": "Acme", "minimum": 20000, "fixed": 0, "start": "2026-03", "end": None},
+        {"id": 2, "name": "Brightline", "minimum": 50000, "fixed": 5000, "start": "2026-05", "end": None},
+        {"id": 3, "name": "Cobalt (signed)", "minimum": 100000, "fixed": 0, "start": "2027-02", "end": None},
+    ]})
+    return d
+
+
+def test_forecast_never_below_the_clients_minimums():
+    d = billed_sample(delay=0)
+    d["products"][0]["months"] = {"2026-07": {"revenue": 80000, "cost": 10000}, "2026-08": {"revenue": 76000, "cost": 9000},
+                                  "2026-09": {"revenue": 75000, "cost": 9000}}
+    d["products"][0]["figures"] = []
+    s = rf.build(d, TODAY)
+    p = s["products"][0]
+    assert p["committed"] == 20000 + 55000
+    inc = {m["month"]: m["inc"] for m in s["months"]}
+    assert all(inc[m] >= 75000 - 1 for m in rf.m_range("2026-10", "2027-01"))
+    assert all(inc[m] >= 175000 - 1 for m in rf.m_range("2027-02", "2027-06"))   # Cobalt's minimum from Feb
+
+
+def test_gmdi_expected_bill_is_taken_as_is():
+    d = billed_sample(delay=0)
+    d["products"][0]["figures"].append({"id": 99, "day": "2026-10-16", "revenue": 9000, "cost": 4000, "forecast": 210000})
+    s = rf.build(d, TODAY)
+    cur = s["products"][0]["current"]
+    assert cur["source"] == "product" and cur["value"] == 210000 and cur["expected_cost"] == 4000
+    assert round(s["now"]["inc"]) == 210000
+
+
+def test_usage_below_minimum_is_billed_the_minimum():
+    d = billed_sample(delay=0)
+    d["products"][0]["figures"] = [{"id": 1, "day": "2026-10-10", "revenue": 3000, "cost": 500, "forecast": None},
+                                   {"id": 2, "day": "2026-10-16", "revenue": 5000, "cost": 900, "forecast": None}]
+    s = rf.build(d, TODAY)
+    cur = s["products"][0]["current"]
+    assert cur["source"] == "usage" and cur["value"] == 75000   # ~₹9.7k usage, but clients' minimums are ₹75k
+
+
+def test_paid_the_month_after():
+    now0 = rf.build(billed_sample(delay=0), TODAY)
+    now1 = rf.build(billed_sample(delay=1), TODAY)
+    sep_bill = 541000
+    assert round(now1["now"]["inc"]) == sep_bill                      # October's money is September's bill
+    m0 = {m["month"]: m for m in now0["months"]}; m1 = {m["month"]: m for m in now1["months"]}
+    assert round(m1["2026-08"]["inc"]) == round(m0["2026-07"]["inc"])
+    assert round(m1["2026-07"]["cost"]) == round(m0["2026-07"]["cost"])   # bank charges stay in their own month
+    assert now1["cash_now"] < now0["cash_now"]                       # September's bill is not in the bank yet

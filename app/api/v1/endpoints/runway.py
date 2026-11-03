@@ -22,11 +22,11 @@ from app.core.config import settings
 from app.core.responses import APIResponse, success_response
 from app.models.runway import (
     BankCheck, CapitalEntry, Expense, ExpenseCategory, ExpenseMonth,
-    Product, ProductFigure, ProductMonth, RunwaySettings,
+    Product, ProductClient, ProductFigure, ProductMonth, RunwaySettings,
 )
 from app.models.user import User
 from app.schemas.runway import (
-    BankIn, CapitalIn, CategoryIn, ExpenseIn, FigureIn, FillMonth, MonthAmount,
+    BankIn, CapitalIn, CategoryIn, ClientIn, ExpenseIn, FigureIn, FillMonth, MonthAmount,
     ProductIn, ProductMonthIn, SettingsIn, MONTH,
 )
 from app.services import runway_forecast as rf
@@ -81,7 +81,7 @@ async def get_settings(db: AsyncSession) -> RunwaySettings:
     db.add(row)
     for i, n in enumerate(DEFAULT_CATEGORIES):
         db.add(ExpenseCategory(name=n, sort_order=i))
-    db.add(Product(name="GMDI", tracking="figures", cost_label="Bank charges", amount=0, start_month="2025-12", sort_order=0))
+    db.add(Product(name="GMDI", tracking="billed", cost_label="Bank charges", amount=0, start_month="2025-12", sort_order=0, pay_delay=1))
     await db.commit()
     await db.refresh(row)
     return row
@@ -99,6 +99,7 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
     prods = sorted(await alive(db, Product), key=lambda p: (p.sort_order, p.id))
     figs = await alive(db, ProductFigure)
     pms = await alive(db, ProductMonth)
+    clients = await alive(db, ProductClient)
     caps = await alive(db, CapitalEntry)
     bank = sorted(await alive(db, BankCheck), key=lambda b: (b.day, b.id))
     live_exp = {e.id for e in exps}
@@ -117,7 +118,9 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
         } for e in sorted(exps, key=lambda e: e.id)],
         "products": [{
             "id": p.id, "name": p.name, "tracking": p.tracking, "cost_label": p.cost_label, "amount": float(p.amount),
-            "start": p.start_month, "end": p.end_month,
+            "start": p.start_month, "end": p.end_month, "pay_delay": int(p.pay_delay or 0),
+            "clients": sorted([{"id": c.id, "name": c.name, "minimum": float(c.minimum), "fixed": float(c.fixed or 0),
+                                "start": c.start_month, "end": c.end_month} for c in clients if c.product_id == p.id], key=lambda c: (c["start"], c["name"].lower())),
             "figures": sorted([{"id": f.id, "day": f.day, "revenue": float(f.revenue), "cost": num(f.cost), "forecast": num(f.forecast)}
                                for f in figs if f.product_id == p.id], key=lambda f: (f["day"], f["id"])),
             "months": {m.month: {"revenue": float(m.revenue), "cost": float(m.cost or 0)} for m in pms if m.product_id == p.id},
@@ -312,7 +315,8 @@ async def create_product(body: ProductIn, db: AsyncSession = Depends(deps.get_db
         raise HTTPException(status_code=400, detail="The end month is before the start month.")
     p = Product(name=body.name.strip(), tracking=body.tracking, cost_label=(body.cost_label or "").strip() or None,
                 amount=body.amount if body.tracking == "fixed" else 0, start_month=body.start_month, end_month=body.end_month,
-                sort_order=len(await alive(db, Product)))
+                sort_order=len(await alive(db, Product)),
+                pay_delay=body.pay_delay if body.pay_delay is not None else (1 if body.tracking == "billed" else 0))
     db.add(p)
     await db.commit()
     return success_response(data=await everything(db) | {"id": p.id}, message="Product added")
@@ -327,6 +331,8 @@ async def update_product(pid: int, body: ProductIn, db: AsyncSession = Depends(d
     p.cost_label = (body.cost_label or "").strip() or None
     p.amount = body.amount if body.tracking == "fixed" else 0
     p.start_month, p.end_month = body.start_month, body.end_month
+    if body.pay_delay is not None:
+        p.pay_delay = body.pay_delay
     await db.commit()
     return success_response(data=await everything(db), message="Product saved")
 
@@ -352,19 +358,23 @@ async def usual_cost_ratio(db: AsyncSession, pid: int) -> Optional[float]:
 
 
 async def save_figure(db: AsyncSession, p: Product, f: ProductFigure, body: FigureIn) -> None:
-    if p.tracking != "figures":
+    if p.tracking == "fixed":
         raise HTTPException(status_code=400, detail="This product has a fixed monthly amount; it does not take figures.")
+    if p.tracking == "billed" and body.forecast is None and not body.revenue:
+        raise HTTPException(status_code=400, detail="Enter the expected bill for this month (or the usage fees so far).")
+    if p.tracking == "figures" and body.revenue is None:
+        raise HTTPException(status_code=400, detail="Enter the revenue so far.")
     if body.day > today().isoformat():
         raise HTTPException(status_code=400, detail="Pick a date up to today.")
     same = [x for x in await alive(db, ProductFigure, ProductFigure.product_id == p.id) if x.id != f.id and x.day[:7] == body.day[:7]]
     before = max((x for x in same if x.day < body.day), key=lambda x: x.day, default=None)
     after = min((x for x in same if x.day > body.day), key=lambda x: x.day, default=None)
-    if before and body.revenue < float(before.revenue):
+    if before and body.revenue and body.revenue < float(before.revenue):
         raise HTTPException(status_code=400, detail=f"This is lower than the figure on {before.day} (₹{float(before.revenue):,.0f}). Revenue so far can only go up within a month.")
-    if after and body.revenue > float(after.revenue):
+    if after and float(after.revenue) and body.revenue > float(after.revenue):
         raise HTTPException(status_code=400, detail=f"This is higher than the later figure on {after.day} (₹{float(after.revenue):,.0f}).")
     cost = body.cost
-    if cost is None and p.cost_label:
+    if cost is None and p.cost_label and p.tracking == "figures":
         ratio = await usual_cost_ratio(db, p.id)
         cost = round(body.revenue * ratio, 2) if ratio is not None else None
     f.day, f.revenue, f.cost, f.forecast = body.day, body.revenue, cost, body.forecast
@@ -426,6 +436,48 @@ async def delete_product_month(pid: int, month: str, db: AsyncSession = Depends(
     return success_response(data=await everything(db), message="Month total removed")
 
 
+# ----------------------------------------------------------------- clients of a billed product
+
+async def save_client(db: AsyncSession, p: Product, c: ProductClient, body: ClientIn) -> None:
+    if p.tracking != "billed":
+        raise HTTPException(status_code=400, detail="Clients and minimums are for products billed monthly, like GMDI.")
+    if body.end_month and body.end_month < body.start_month:
+        raise HTTPException(status_code=400, detail="The end month is before the start month.")
+    c.name, c.minimum, c.fixed = body.name.strip(), body.minimum, body.fixed
+    c.start_month, c.end_month = body.start_month, body.end_month
+
+
+@router.post("/products/{pid}/clients", response_model=APIResponse)
+async def add_client(pid: int, body: ClientIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    p = await get_or_404(db, Product, pid, "Product")
+    c = ProductClient(product_id=pid, name="", minimum=0, fixed=0, start_month=body.start_month)
+    await save_client(db, p, c, body)
+    db.add(c)
+    await db.commit()
+    return success_response(data=await everything(db) | {"id": c.id}, message="Client added")
+
+
+@router.put("/products/{pid}/clients/{cid}", response_model=APIResponse)
+async def update_client(pid: int, cid: int, body: ClientIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    p = await get_or_404(db, Product, pid, "Product")
+    c = await get_or_404(db, ProductClient, cid, "Client")
+    if c.product_id != pid:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    await save_client(db, p, c, body)
+    await db.commit()
+    return success_response(data=await everything(db), message="Client saved")
+
+
+@router.delete("/products/{pid}/clients/{cid}", response_model=APIResponse)
+async def delete_client(pid: int, cid: int, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    c = await get_or_404(db, ProductClient, cid, "Client")
+    if c.product_id != pid:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    c.is_deleted = True
+    await db.commit()
+    return success_response(data=await everything(db), message="Client deleted")
+
+
 # ----------------------------------------------------------------- capital, bank, settings
 
 @router.post("/capital", response_model=APIResponse)
@@ -474,7 +526,7 @@ async def update_settings(body: SettingsIn, db: AsyncSession = Depends(deps.get_
 
 # ----------------------------------------------------------------- undo
 
-RESTORABLE = {"expense": Expense, "product": Product, "figure": ProductFigure, "capital": CapitalEntry, "category": ExpenseCategory}
+RESTORABLE = {"expense": Expense, "product": Product, "figure": ProductFigure, "capital": CapitalEntry, "category": ExpenseCategory, "client": ProductClient}
 
 
 @router.post("/restore/{kind}/{rid}", response_model=APIResponse)

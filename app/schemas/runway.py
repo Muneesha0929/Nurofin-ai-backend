@@ -35,16 +35,25 @@ class FillMonth(BaseModel):
 
 class ProductIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
-    tracking: Literal["figures", "fixed"]
+    tracking: Literal["figures", "fixed", "billed"]
     cost_label: Optional[str] = Field(None, max_length=80)
     amount: float = Field(0, ge=0, le=1e12)
+    start_month: str = Field(..., pattern=MONTH)
+    end_month: Optional[str] = Field(None, pattern=MONTH)
+    pay_delay: Optional[int] = Field(None, ge=0, le=3)   # months between the bill and the money arriving
+
+
+class ClientIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=160)
+    minimum: float = Field(0, ge=0, le=1e12)
+    fixed: float = Field(0, ge=0, le=1e12)
     start_month: str = Field(..., pattern=MONTH)
     end_month: Optional[str] = Field(None, pattern=MONTH)
 
 
 class FigureIn(BaseModel):
     day: str = Field(..., pattern=DAY)
-    revenue: float = Money
+    revenue: float = Field(0, ge=0, le=1e12)     # revenue / usage fees so far this month
     cost: Optional[float] = Field(None, ge=0, le=1e12)
     forecast: Optional[float] = Field(None, ge=0, le=1e12)
 
