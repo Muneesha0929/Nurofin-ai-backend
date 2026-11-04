@@ -263,3 +263,37 @@ def test_confidence_rises_with_real_data():
     rich = rf.build(rich_d, NOV)["confidence"]
     assert thin["score"] < 45 <= rich["score"]
     assert {"history", "bank"} <= {g["key"] for g in thin["gaps"]}
+
+
+# ---------------------------------------------------------------- received vs expected
+
+def test_paid_less_is_carried_as_owed_into_this_month():
+    base = rf.build(billed_sample(delay=1), TODAY)
+    p0 = base["products"][0]
+    sep_expected = p0["cash"]["2026-09"]["expected"]          # August's bill, due in September
+    d = billed_sample(delay=1)
+    d["products"][0]["received"] = {"2026-09": sep_expected - 100000}
+    s = rf.build(d, TODAY)
+    p = s["products"][0]
+    assert round(p["cash"]["2026-09"]["cash"]) == round(sep_expected - 100000)
+    assert round(p["owed_now"]) == 100000
+    assert round(p["paid_this_month"] - p0["paid_this_month"]) == 100000   # the arrears are expected now
+    assert round(s["cash_now"] - base["cash_now"]) == -100000               # and are not in the bank yet
+
+
+def test_paid_ahead_reduces_what_is_expected_next():
+    base = rf.build(billed_sample(delay=1), TODAY)
+    p0 = base["products"][0]
+    sep_expected = p0["cash"]["2026-09"]["expected"]
+    d = billed_sample(delay=1)
+    d["products"][0]["received"] = {"2026-09": sep_expected + 50000}        # paid part of October's in September
+    p = rf.build(d, TODAY)["products"][0]
+    assert round(p["owed_now"]) == -50000
+    assert round(p0["paid_this_month"] - p["paid_this_month"]) == 50000
+
+
+def test_no_receipts_changes_nothing():
+    a = rf.build(billed_sample(delay=1), TODAY)
+    d = billed_sample(delay=1); d["products"][0]["received"] = {}
+    b = rf.build(d, TODAY)
+    assert a["expected"] == b["expected"] and a["cash_now"] == b["cash_now"]

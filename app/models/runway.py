@@ -138,6 +138,22 @@ class ProductMonth(Base):
     cost = Column(MONEY, nullable=False, default=0)
 
 
+class ProductReceipt(Base):
+    """Money that actually reached the bank from a product in a month (what clients paid).
+
+    Expected money is the bill pay_delay months back; when a client pays less, late or ahead, the
+    CEO types what really came in. The difference is carried as "still owed" (or "paid ahead").
+    """
+    __tablename__ = "cos_fin_product_receipt"
+    __table_args__ = (UniqueConstraint("product_id", "month", name="uix_cos_fin_product_receipt"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("cos_fin_product.id"), nullable=False, index=True)
+    month = Column(String(7), nullable=False)
+    amount = Column(MONEY, nullable=False)
+    note = Column(String(200), nullable=True)
+
+
 class CapitalEntry(Base):
     """Money put into the company. A future date is a planned top-up."""
     __tablename__ = "cos_fin_capital"
@@ -160,5 +176,5 @@ class BankCheck(Base):
 RUNWAY_TABLES = [
     "cos_fin_settings", "cos_fin_category", "cos_fin_expense", "cos_fin_expense_month",
     "cos_fin_product", "cos_fin_product_figure", "cos_fin_product_month", "cos_fin_product_client",
-    "cos_fin_capital", "cos_fin_bank_check",
+    "cos_fin_capital", "cos_fin_bank_check", "cos_fin_product_receipt",
 ]

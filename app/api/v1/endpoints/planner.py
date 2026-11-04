@@ -347,6 +347,37 @@ async def get_user_schedule(
         finally:
             await db.commit()
 
+    # Outlook was connectable but never read; show its events like Google's.
+    if target_user.outlook_access_token and target_user.outlook_refresh_token:
+        try:
+            for item in fetch_outlook_events(target_user, time_min, time_max, extra_fields="isAllDay,isCancelled,onlineMeeting"):
+                if item.get("isCancelled"):
+                    continue
+                start = (item.get("start") or {}).get("dateTime")
+                end = (item.get("end") or {}).get("dateTime")
+                schedule.append({
+                    "source": "outlook_calendar",
+                    "title": item.get("subject") or "Busy",
+                    "description": item.get("bodyPreview", ""),
+                    "start": (start + "Z") if start and not start.endswith("Z") and "+" not in start[10:] else start,
+                    "end": (end + "Z") if end and not end.endswith("Z") and "+" not in end[10:] else end,
+                    "type": "outlook_event",
+                    "status": "scheduled",
+                    "read_only": True,
+                    "hangout_link": (item.get("onlineMeeting") or {}).get("joinUrl"),
+                    "event_link": item.get("webLink"),
+                    "location": (item.get("location") or {}).get("displayName"),
+                })
+        except Exception as e:
+            print(f"Failed to fetch Outlook Calendar for user {target_user_id}: {e}")
+            schedule.append({
+                "source": "outlook_error", "title": "Outlook sync failed",
+                "description": "Could not load Outlook events. Reconnect Outlook if this keeps happening.",
+                "start": None, "end": None, "type": "outlook_error", "status": "error", "read_only": True, "error": str(e)[:200],
+            })
+        finally:
+            await db.commit()
+
     def get_sort_key(x):
         dt = x.get("start") or x.get("date")
         if isinstance(dt, datetime):

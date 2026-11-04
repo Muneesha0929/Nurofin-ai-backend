@@ -8,7 +8,7 @@ later anyone can search "animations" and read why Reduce motion exists.
 Features are never deleted either; "Not doing" with a reason is how an idea is closed.
 Tables start with cos_ so they never collide with the hand-made tables in production.
 """
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
 from app.db.base_class import Base
 
 FEATURE_STATUSES = ("suggested", "planned", "building", "shipped", "not_doing")
@@ -93,3 +93,64 @@ class ProductFeatureTask(Base):
 
 
 FEATURE_TABLES = ["cos_feature", "cos_feature_event", "cos_feature_solution", "cos_feature_solution_vote", "cos_feature_me_too", "cos_feature_task"]
+
+
+# ----------------------------------------------------------------- products, attachments, costs (4 Nov)
+
+class AppProduct(Base):
+    """A product the company builds (GMDI, Build-Track, Chief of Staff). Features are tagged with it.
+    Kept apart from Runway's money products, which are private to the CEO."""
+    __tablename__ = "cos_product"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(120), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+
+class ProductFeatureProduct(Base):
+    __tablename__ = "cos_feature_product"
+    __table_args__ = (UniqueConstraint("feature_id", "product_id", name="uix_cos_feature_product"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_id = Column(Integer, ForeignKey("cos_feature.id"), nullable=False, index=True)
+    product_id = Column(Integer, ForeignKey("cos_product.id"), nullable=False, index=True)
+
+
+class ProductFeatureAttachment(Base):
+    """A screenshot or supporting document on a feature, or on one of its ideas.
+    Stored with the app's S3 helper (local disk when S3 is not configured)."""
+    __tablename__ = "cos_feature_attachment"
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_id = Column(Integer, ForeignKey("cos_feature.id"), nullable=False, index=True)
+    solution_id = Column(Integer, ForeignKey("cos_feature_solution.id"), nullable=True)
+    filename = Column(String(255), nullable=False)
+    content_type = Column(String(120), nullable=False)
+    size = Column(Integer, nullable=False, default=0)
+    storage_key = Column(String(400), nullable=False)
+    uploaded_by_id = Column(Integer, ForeignKey("user.id"), nullable=False)
+
+
+class ProductFeatureCost(Base):
+    """One line of a feature's cost and profit estimate.
+
+    side = 'cost' (what it takes: people's time, tools, hosting) or 'benefit' (what it brings:
+    new revenue, money saved). kind = 'one_time' or 'monthly'. People's time can be entered as
+    days x rate; amount is then days * rate.
+    """
+    __tablename__ = "cos_feature_cost"
+
+    id = Column(Integer, primary_key=True, index=True)
+    feature_id = Column(Integer, ForeignKey("cos_feature.id"), nullable=False, index=True)
+    side = Column(String(10), nullable=False)
+    label = Column(String(200), nullable=False)
+    kind = Column(String(10), nullable=False, default="one_time")
+    amount = Column(Numeric(14, 2), nullable=False, default=0)
+    days = Column(Numeric(8, 2), nullable=True)
+    rate = Column(Numeric(14, 2), nullable=True)
+    note = Column(String(300), nullable=True)
+    sort_order = Column(Integer, nullable=False, default=0)
+
+
+FEATURE_EXTRA_TABLES = ["cos_product", "cos_feature_product", "cos_feature_attachment", "cos_feature_cost"]
+DEFAULT_PRODUCTS = ["GMDI", "Build-Track", "Chief of Staff"]

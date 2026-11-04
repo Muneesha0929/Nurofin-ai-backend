@@ -42,3 +42,5 @@ from app.api.v1.endpoints import runway
 api_router.include_router(runway.router, prefix="/runway", tags=["runway"])
 from app.api.v1.endpoints import product_features
 api_router.include_router(product_features.router, prefix="/product-features", tags=["product-features"])
+from app.api.v1.endpoints import my_meetings
+api_router.include_router(my_meetings.router, prefix="/my-meetings", tags=["my-meetings"])

@@ -343,15 +343,44 @@ def build(data: Dict[str, Any], today: date) -> Dict[str, Any]:
                 pm["cost"] += b["cost"]; pm["cost_lo"] += b["cost_lo"]
                 if b["cost"]:
                     pm["costs"][p["id"]] = b["cost"]
-            paid = bill.get(add_m(m, -delay)) if delay else b
-            if paid:
+        # Money that reaches the bank. Expected: the bill pay_delay months back. Received: what the CEO
+        # typed for a past month (a client may pay less, late, or ahead). The difference is carried:
+        # still owed is expected in the current month; paid ahead comes off the next months.
+        received = p.get("received") or {}
+        owed = 0.0
+        cash_rows: Dict[str, Dict[str, Any]] = {}
+        for m in months:
+            due = bill.get(add_m(m, -delay)) if delay else bill.get(m)
+            exp_v = due["v"] if due else 0.0
+            lo, hi = (due["lo"], due["hi"]) if due else (0.0, 0.0)
+            if m < cur:
+                got = received.get(m)
+                cash = got if got is not None else exp_v
+                owed += exp_v - cash
+                lo = hi = cash
+                cash_rows[m] = {"expected": exp_v, "received": got, "cash": cash, "owed_after": owed}
+            else:
+                carry = owed
+                cash = max(exp_v + carry, 0.0)
+                used = cash - exp_v                         # how much of the carry this month absorbs
+                owed = carry - used
+                lo, hi = max(lo + used, 0.0), max(hi + used, 0.0)
+                got = received.get(m)
+                if got is not None and got > cash:          # already received more this month than expected
+                    owed -= got - cash
+                    cash = lo = hi = got
+                cash_rows[m] = {"expected": exp_v, "received": got, "cash": cash, "owed_after": owed}
+            if cash or lo or hi:
                 pm = p_by_month[m]
-                pm["rev"] += paid["v"]; pm["lo"] += paid["lo"]; pm["hi"] += paid["hi"]
+                pm["rev"] += cash; pm["lo"] += lo; pm["hi"] += hi
+        out["cash"] = cash_rows
+        last_closed = add_m(cur, -1)
+        out["owed_now"] = (cash_rows.get(last_closed) or {}).get("owed_after", 0.0)
         out["grid"] = {m: {"v": b["v"], "cost": b["cost"], "how": how.get(m, "forecast")} for m, b in bill.items()}
         out["future_split"] = {"committed": sum(min(bill[m].get("committed", bill[m]["v"] if how.get(m) in ("typed", "rule") else 0.0), bill[m]["v"])
                                                 for m in fut[:6] if m in bill),
                                "total": sum(bill[m]["v"] for m in fut[:6] if m in bill)}
-        out["paid_this_month"] = (bill.get(add_m(cur, -delay)) or {}).get("v", 0.0)
+        out["paid_this_month"] = (cash_rows.get(cur) or {}).get("cash", 0.0)
         out["billed_this_month"] = (bill.get(cur) or {}).get("v", 0.0)
         prods_out.append(out)
 

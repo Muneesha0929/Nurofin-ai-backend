@@ -84,7 +84,7 @@ class SettingsIn(BaseModel):
 # ----------------------------------------------------------------- the spreadsheet
 
 class CellIn(BaseModel):
-    row: str = Field(..., pattern=r"^(e:\d+|p:\d+|cap)$")   # e:<expense id>, p:<product id>, cap = money put in
+    row: str = Field(..., pattern=r"^(e:\d+|p:\d+|r:\d+|cap)$")   # e:<expense>, p:<product bill>, r:<product received>, cap
     month: str = Field(..., pattern=MONTH)
     amount: Optional[float] = Field(None, ge=0, le=1e12)       # null clears the cell (back to the rule / forecast)
 

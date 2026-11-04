@@ -22,7 +22,7 @@ from app.core.config import settings
 from app.core.responses import APIResponse, success_response
 from app.models.runway import (
     BankCheck, CapitalEntry, Expense, ExpenseCategory, ExpenseMonth,
-    Product, ProductClient, ProductFigure, ProductMonth, RunwaySettings,
+    Product, ProductClient, ProductFigure, ProductMonth, ProductReceipt, RunwaySettings,
 )
 from app.models.user import User
 from app.schemas.runway import (
@@ -100,6 +100,7 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
     figs = await alive(db, ProductFigure)
     pms = await alive(db, ProductMonth)
     clients = await alive(db, ProductClient)
+    receipts = await alive(db, ProductReceipt)
     caps = await alive(db, CapitalEntry)
     bank = sorted(await alive(db, BankCheck), key=lambda b: (b.day, b.id))
     live_exp = {e.id for e in exps}
@@ -119,6 +120,7 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
         "products": [{
             "id": p.id, "name": p.name, "tracking": p.tracking, "cost_label": p.cost_label, "amount": float(p.amount),
             "start": p.start_month, "end": p.end_month, "pay_delay": int(p.pay_delay or 0),
+            "received": {r.month: float(r.amount) for r in receipts if r.product_id == p.id},
             "clients": sorted([{"id": c.id, "name": c.name, "minimum": float(c.minimum), "fixed": float(c.fixed or 0),
                                 "start": c.start_month, "end": c.end_month} for c in clients if c.product_id == p.id], key=lambda c: (c["start"], c["name"].lower())),
             "figures": sorted([{"id": f.id, "day": f.day, "revenue": float(f.revenue), "cost": num(f.cost), "forecast": num(f.forecast)}
@@ -660,8 +662,24 @@ async def save_cells(body: CellsIn, db: AsyncSession = Depends(deps.get_db), use
 
       e:<id>  an expense line: the figure for that month (past = paid, future = the plan for that month)
       p:<id>  an income line: the month's total (past = final, future = the plan for that month)
+      r:<id>  money actually received from that income line in that month (null = as expected)
       cap     money put in that month (replaces that month's entries with one on the 1st)
     """
+    from sqlalchemy.exc import IntegrityError
+    for attempt in (1, 2):
+        try:
+            await _apply_cells(db, body)
+            break
+        except IntegrityError:
+            # the same new cell saved twice at once: the other save made the row, so update it instead
+            await db.rollback()
+            if attempt == 2:
+                raise HTTPException(status_code=409, detail="Two saves crossed. Reload the sheet and try again.")
+    n = len(body.changes)
+    return success_response(data=await everything(db), message=f"Saved {n} cell{'s' if n != 1 else ''}")
+
+
+async def _apply_cells(db: AsyncSession, body: CellsIn) -> None:
     exps = {e.id for e in await alive(db, Expense)}
     prods = {p.id: p for p in await alive(db, Product)}
     for c in body.changes:
@@ -670,6 +688,18 @@ async def save_cells(body: CellsIn, db: AsyncSession = Depends(deps.get_db), use
             if int(rid) not in exps:
                 raise HTTPException(status_code=404, detail="That expense line no longer exists. Reload the page.")
             await set_month(db, int(rid), c.month, c.amount)
+        elif kind == "r":
+            p = prods.get(int(rid))
+            if not p:
+                raise HTTPException(status_code=404, detail="That income line no longer exists. Reload the page.")
+            row = (await db.execute(select(ProductReceipt).filter(ProductReceipt.product_id == p.id, ProductReceipt.month == c.month))).scalars().first()
+            if c.amount is None:
+                if row:
+                    await db.delete(row)
+            elif row:
+                row.amount, row.is_deleted = c.amount, False
+            else:
+                db.add(ProductReceipt(product_id=p.id, month=c.month, amount=c.amount))
         elif kind == "p":
             p = prods.get(int(rid))
             if not p:
@@ -687,8 +717,6 @@ async def save_cells(body: CellsIn, db: AsyncSession = Depends(deps.get_db), use
                 db.add(CapitalEntry(day=f"{c.month}-01", amount=c.amount, note=(notes or "From the sheet")[:200]))
         await db.flush()
     await db.commit()
-    n = len(body.changes)
-    return success_response(data=await everything(db), message=f"Saved {n} cell{'s' if n != 1 else ''}")
 
 
 @router.post("/expenses/{eid}/from", response_model=APIResponse)
