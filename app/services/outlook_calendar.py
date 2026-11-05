@@ -84,7 +84,7 @@ def refresh_credentials(user):
     return user.outlook_access_token
 
 
-def fetch_calendar_events(user, time_min: datetime, time_max: datetime):
+def fetch_calendar_events(user, time_min: datetime, time_max: datetime, extra_fields: str = ""):
     access_token = refresh_credentials(user)
     
     # Microsoft Graph endpoint for calendar view
@@ -94,7 +94,7 @@ def fetch_calendar_events(user, time_min: datetime, time_max: datetime):
     params = {
         "startDateTime": time_min.isoformat(),
         "endDateTime": time_max.isoformat(),
-        "$select": "subject,bodyPreview,start,end,location,webLink,showAs",
+        "$select": "subject,bodyPreview,start,end,location,webLink,showAs" + ("," + extra_fields if extra_fields else ""),
         "$top": 250,
         "$orderby": "start/dateTime"
     }

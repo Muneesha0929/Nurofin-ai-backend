@@ -22,11 +22,11 @@ from app.core.config import settings
 from app.core.responses import APIResponse, success_response
 from app.models.runway import (
     BankCheck, CapitalEntry, Expense, ExpenseCategory, ExpenseMonth,
-    Product, ProductFigure, ProductMonth, RunwaySettings,
+    Product, ProductClient, ProductFigure, ProductMonth, ProductReceipt, RunwaySettings,
 )
 from app.models.user import User
 from app.schemas.runway import (
-    BankIn, CapitalIn, CategoryIn, ExpenseIn, FigureIn, FillMonth, MonthAmount,
+    BankIn, CapitalIn, CategoryIn, CellsIn, ClientIn, ExpenseIn, FigureIn, FillMonth, FromMonthIn, MonthAmount, RowIn,
     ProductIn, ProductMonthIn, SettingsIn, MONTH,
 )
 from app.services import runway_forecast as rf
@@ -81,7 +81,7 @@ async def get_settings(db: AsyncSession) -> RunwaySettings:
     db.add(row)
     for i, n in enumerate(DEFAULT_CATEGORIES):
         db.add(ExpenseCategory(name=n, sort_order=i))
-    db.add(Product(name="GMDI", tracking="figures", cost_label="Bank charges", amount=0, start_month="2025-12", sort_order=0))
+    db.add(Product(name="GMDI", tracking="billed", cost_label="Bank charges", amount=0, start_month="2025-12", sort_order=0, pay_delay=1))
     await db.commit()
     await db.refresh(row)
     return row
@@ -99,6 +99,8 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
     prods = sorted(await alive(db, Product), key=lambda p: (p.sort_order, p.id))
     figs = await alive(db, ProductFigure)
     pms = await alive(db, ProductMonth)
+    clients = await alive(db, ProductClient)
+    receipts = await alive(db, ProductReceipt)
     caps = await alive(db, CapitalEntry)
     bank = sorted(await alive(db, BankCheck), key=lambda b: (b.day, b.id))
     live_exp = {e.id for e in exps}
@@ -117,7 +119,10 @@ async def load(db: AsyncSession) -> Dict[str, Any]:
         } for e in sorted(exps, key=lambda e: e.id)],
         "products": [{
             "id": p.id, "name": p.name, "tracking": p.tracking, "cost_label": p.cost_label, "amount": float(p.amount),
-            "start": p.start_month, "end": p.end_month,
+            "start": p.start_month, "end": p.end_month, "pay_delay": int(p.pay_delay or 0),
+            "received": {r.month: float(r.amount) for r in receipts if r.product_id == p.id},
+            "clients": sorted([{"id": c.id, "name": c.name, "minimum": float(c.minimum), "fixed": float(c.fixed or 0),
+                                "start": c.start_month, "end": c.end_month} for c in clients if c.product_id == p.id], key=lambda c: (c["start"], c["name"].lower())),
             "figures": sorted([{"id": f.id, "day": f.day, "revenue": float(f.revenue), "cost": num(f.cost), "forecast": num(f.forecast)}
                                for f in figs if f.product_id == p.id], key=lambda f: (f["day"], f["id"])),
             "months": {m.month: {"revenue": float(m.revenue), "cost": float(m.cost or 0)} for m in pms if m.product_id == p.id},
@@ -220,6 +225,7 @@ async def set_month(db: AsyncSession, expense_id: int, month: str, amount: Optio
 async def apply_expense(db: AsyncSession, e: Expense, body: ExpenseIn, is_new: bool) -> None:
     s = await get_settings(db)
     cur = cur_month()
+    before = None if is_new else (e.how, float(e.amount or 0), e.start_month, e.end_month)
     category_id = await resolve_category(db, body)   # queries first: a pending new row must not autoflush half-filled
     e.name, e.how, e.category_id = body.name.strip(), body.how, category_id
     if is_new:
@@ -236,6 +242,16 @@ async def apply_expense(db: AsyncSession, e: Expense, body: ExpenseIn, is_new: b
     start = body.start_month or cur
     if body.end_month and body.end_month < start:
         raise HTTPException(status_code=400, detail="The end month is before the start month.")
+    if before and before[0] == "monthly" and abs(before[1] - body.amount) > .005:
+        # past months of a same-every-month line count its amount; when the amount changes,
+        # write the old amount into the past months first so history stays what was really paid
+        last = rf.add_m(cur, -1)
+        end = min(before[3] or last, last)
+        if before[2] <= end:
+            have = {r.month for r in await alive(db, ExpenseMonth, ExpenseMonth.expense_id == e.id)}
+            for m in rf.m_range(before[2], end):
+                if m not in have:
+                    db.add(ExpenseMonth(expense_id=e.id, month=m, amount=before[1]))
     e.amount, e.start_month, e.end_month = body.amount, start, body.end_month
     e.raise_pct = body.raise_pct if body.how == "monthly" else 0
     await db.flush()
@@ -301,7 +317,8 @@ async def create_product(body: ProductIn, db: AsyncSession = Depends(deps.get_db
         raise HTTPException(status_code=400, detail="The end month is before the start month.")
     p = Product(name=body.name.strip(), tracking=body.tracking, cost_label=(body.cost_label or "").strip() or None,
                 amount=body.amount if body.tracking == "fixed" else 0, start_month=body.start_month, end_month=body.end_month,
-                sort_order=len(await alive(db, Product)))
+                sort_order=len(await alive(db, Product)),
+                pay_delay=body.pay_delay if body.pay_delay is not None else (1 if body.tracking == "billed" else 0))
     db.add(p)
     await db.commit()
     return success_response(data=await everything(db) | {"id": p.id}, message="Product added")
@@ -316,6 +333,8 @@ async def update_product(pid: int, body: ProductIn, db: AsyncSession = Depends(d
     p.cost_label = (body.cost_label or "").strip() or None
     p.amount = body.amount if body.tracking == "fixed" else 0
     p.start_month, p.end_month = body.start_month, body.end_month
+    if body.pay_delay is not None:
+        p.pay_delay = body.pay_delay
     await db.commit()
     return success_response(data=await everything(db), message="Product saved")
 
@@ -341,19 +360,23 @@ async def usual_cost_ratio(db: AsyncSession, pid: int) -> Optional[float]:
 
 
 async def save_figure(db: AsyncSession, p: Product, f: ProductFigure, body: FigureIn) -> None:
-    if p.tracking != "figures":
+    if p.tracking == "fixed":
         raise HTTPException(status_code=400, detail="This product has a fixed monthly amount; it does not take figures.")
+    if p.tracking == "billed" and body.forecast is None and not body.revenue:
+        raise HTTPException(status_code=400, detail="Enter the expected bill for this month (or the usage fees so far).")
+    if p.tracking == "figures" and body.revenue is None:
+        raise HTTPException(status_code=400, detail="Enter the revenue so far.")
     if body.day > today().isoformat():
         raise HTTPException(status_code=400, detail="Pick a date up to today.")
     same = [x for x in await alive(db, ProductFigure, ProductFigure.product_id == p.id) if x.id != f.id and x.day[:7] == body.day[:7]]
     before = max((x for x in same if x.day < body.day), key=lambda x: x.day, default=None)
     after = min((x for x in same if x.day > body.day), key=lambda x: x.day, default=None)
-    if before and body.revenue < float(before.revenue):
+    if before and body.revenue and body.revenue < float(before.revenue):
         raise HTTPException(status_code=400, detail=f"This is lower than the figure on {before.day} (₹{float(before.revenue):,.0f}). Revenue so far can only go up within a month.")
-    if after and body.revenue > float(after.revenue):
+    if after and float(after.revenue) and body.revenue > float(after.revenue):
         raise HTTPException(status_code=400, detail=f"This is higher than the later figure on {after.day} (₹{float(after.revenue):,.0f}).")
     cost = body.cost
-    if cost is None and p.cost_label:
+    if cost is None and p.cost_label and p.tracking == "figures":
         ratio = await usual_cost_ratio(db, p.id)
         cost = round(body.revenue * ratio, 2) if ratio is not None else None
     f.day, f.revenue, f.cost, f.forecast = body.day, body.revenue, cost, body.forecast
@@ -390,19 +413,22 @@ async def delete_figure(pid: int, fid: int, db: AsyncSession = Depends(deps.get_
     return success_response(data=await everything(db), message="Figure deleted")
 
 
+async def save_product_month(db: AsyncSession, p: Product, month: str, revenue: float, cost: Optional[float]) -> None:
+    if cost is None:
+        ratio = await usual_cost_ratio(db, p.id) if p.cost_label else None
+        cost = round(revenue * ratio, 2) if ratio is not None else 0
+    row = (await db.execute(select(ProductMonth).filter(ProductMonth.product_id == p.id, ProductMonth.month == month))).scalars().first()
+    if row:
+        row.revenue, row.cost, row.is_deleted = revenue, cost, False
+    else:
+        db.add(ProductMonth(product_id=p.id, month=month, revenue=revenue, cost=cost))
+
+
 @router.put("/products/{pid}/months/{month}", response_model=APIResponse)
 async def set_product_month(pid: int, month: str, body: ProductMonthIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
     check_month(month)
     p = await get_or_404(db, Product, pid, "Product")
-    cost = body.cost
-    if cost is None:
-        ratio = await usual_cost_ratio(db, pid) if p.cost_label else None
-        cost = round(body.revenue * ratio, 2) if ratio is not None else 0
-    row = (await db.execute(select(ProductMonth).filter(ProductMonth.product_id == pid, ProductMonth.month == month))).scalars().first()
-    if row:
-        row.revenue, row.cost, row.is_deleted = body.revenue, cost, False
-    else:
-        db.add(ProductMonth(product_id=pid, month=month, revenue=body.revenue, cost=cost))
+    await save_product_month(db, p, month, body.revenue, body.cost)
     await db.commit()
     return success_response(data=await everything(db), message="Month total saved")
 
@@ -413,6 +439,48 @@ async def delete_product_month(pid: int, month: str, db: AsyncSession = Depends(
     await db.execute(sa_delete(ProductMonth).where(ProductMonth.product_id == pid, ProductMonth.month == month))
     await db.commit()
     return success_response(data=await everything(db), message="Month total removed")
+
+
+# ----------------------------------------------------------------- clients of a billed product
+
+async def save_client(db: AsyncSession, p: Product, c: ProductClient, body: ClientIn) -> None:
+    if p.tracking != "billed":
+        raise HTTPException(status_code=400, detail="Clients and minimums are for products billed monthly, like GMDI.")
+    if body.end_month and body.end_month < body.start_month:
+        raise HTTPException(status_code=400, detail="The end month is before the start month.")
+    c.name, c.minimum, c.fixed = body.name.strip(), body.minimum, body.fixed
+    c.start_month, c.end_month = body.start_month, body.end_month
+
+
+@router.post("/products/{pid}/clients", response_model=APIResponse)
+async def add_client(pid: int, body: ClientIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    p = await get_or_404(db, Product, pid, "Product")
+    c = ProductClient(product_id=pid, name="", minimum=0, fixed=0, start_month=body.start_month)
+    await save_client(db, p, c, body)
+    db.add(c)
+    await db.commit()
+    return success_response(data=await everything(db) | {"id": c.id}, message="Client added")
+
+
+@router.put("/products/{pid}/clients/{cid}", response_model=APIResponse)
+async def update_client(pid: int, cid: int, body: ClientIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    p = await get_or_404(db, Product, pid, "Product")
+    c = await get_or_404(db, ProductClient, cid, "Client")
+    if c.product_id != pid:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    await save_client(db, p, c, body)
+    await db.commit()
+    return success_response(data=await everything(db), message="Client saved")
+
+
+@router.delete("/products/{pid}/clients/{cid}", response_model=APIResponse)
+async def delete_client(pid: int, cid: int, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    c = await get_or_404(db, ProductClient, cid, "Client")
+    if c.product_id != pid:
+        raise HTTPException(status_code=404, detail="Client not found.")
+    c.is_deleted = True
+    await db.commit()
+    return success_response(data=await everything(db), message="Client deleted")
 
 
 # ----------------------------------------------------------------- capital, bank, settings
@@ -463,7 +531,7 @@ async def update_settings(body: SettingsIn, db: AsyncSession = Depends(deps.get_
 
 # ----------------------------------------------------------------- undo
 
-RESTORABLE = {"expense": Expense, "product": Product, "figure": ProductFigure, "capital": CapitalEntry, "category": ExpenseCategory}
+RESTORABLE = {"expense": Expense, "product": Product, "figure": ProductFigure, "capital": CapitalEntry, "category": ExpenseCategory, "client": ProductClient}
 
 
 @router.post("/restore/{kind}/{rid}", response_model=APIResponse)
@@ -583,3 +651,108 @@ async def import_apply(body: ImportIn, db: AsyncSession = Depends(deps.get_db), 
     await db.commit()
     return success_response(data=await everything(db) | {"imported": counts | {
         "categories": len(plan["categories"]), "expenses": len(plan["expenses"]), "products": len(plan["products"])}}, message="Imported")
+
+
+# ----------------------------------------------------------------- the spreadsheet
+
+@router.post("/cells", response_model=APIResponse)
+async def save_cells(body: CellsIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    """Many cells in one go: a typed value, a range filled with one value, a block pasted from Excel,
+    or an undo. Each change is {row, month, amount}; amount null clears the cell.
+
+      e:<id>  an expense line: the figure for that month (past = paid, future = the plan for that month)
+      p:<id>  an income line: the month's total (past = final, future = the plan for that month)
+      r:<id>  money actually received from that income line in that month (null = as expected)
+      cap     money put in that month (replaces that month's entries with one on the 1st)
+    """
+    from sqlalchemy.exc import IntegrityError
+    for attempt in (1, 2):
+        try:
+            await _apply_cells(db, body)
+            break
+        except IntegrityError:
+            # the same new cell saved twice at once: the other save made the row, so update it instead
+            await db.rollback()
+            if attempt == 2:
+                raise HTTPException(status_code=409, detail="Two saves crossed. Reload the sheet and try again.")
+    n = len(body.changes)
+    return success_response(data=await everything(db), message=f"Saved {n} cell{'s' if n != 1 else ''}")
+
+
+async def _apply_cells(db: AsyncSession, body: CellsIn) -> None:
+    exps = {e.id for e in await alive(db, Expense)}
+    prods = {p.id: p for p in await alive(db, Product)}
+    for c in body.changes:
+        kind, _, rid = c.row.partition(":")
+        if kind == "e":
+            if int(rid) not in exps:
+                raise HTTPException(status_code=404, detail="That expense line no longer exists. Reload the page.")
+            await set_month(db, int(rid), c.month, c.amount)
+        elif kind == "r":
+            p = prods.get(int(rid))
+            if not p:
+                raise HTTPException(status_code=404, detail="That income line no longer exists. Reload the page.")
+            row = (await db.execute(select(ProductReceipt).filter(ProductReceipt.product_id == p.id, ProductReceipt.month == c.month))).scalars().first()
+            if c.amount is None:
+                if row:
+                    await db.delete(row)
+            elif row:
+                row.amount, row.is_deleted = c.amount, False
+            else:
+                db.add(ProductReceipt(product_id=p.id, month=c.month, amount=c.amount))
+        elif kind == "p":
+            p = prods.get(int(rid))
+            if not p:
+                raise HTTPException(status_code=404, detail="That income line no longer exists. Reload the page.")
+            if c.amount is None:
+                await db.execute(sa_delete(ProductMonth).where(ProductMonth.product_id == p.id, ProductMonth.month == c.month))
+            else:
+                await save_product_month(db, p, c.month, c.amount, None)
+        else:
+            olds = [x for x in await alive(db, CapitalEntry) if x.day[:7] == c.month]
+            notes = "; ".join(x.note for x in olds if x.note)
+            for x in olds:
+                x.is_deleted = True
+            if c.amount:
+                db.add(CapitalEntry(day=f"{c.month}-01", amount=c.amount, note=(notes or "From the sheet")[:200]))
+        await db.flush()
+    await db.commit()
+
+
+@router.post("/expenses/{eid}/from", response_model=APIResponse)
+async def expense_from_month(eid: int, body: FromMonthIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    """"From this month on, it's this amount": earlier months keep exactly what they showed (written
+    in where they were only following the rule), the line becomes same-every-month at the new
+    amount from the chosen month, and one-month changes from that month on are dropped."""
+    e = await get_or_404(db, Expense, eid, "Expense")
+    if e.how == "once":
+        raise HTTPException(status_code=400, detail="A one-off cost has no months after it. Type the amount into its month instead.")
+    shown = rf.build(await load(db), today())["grid"]["expenses"].get(e.id, {})
+    have = {r.month for r in await alive(db, ExpenseMonth, ExpenseMonth.expense_id == e.id)}
+    if e.start_month < body.month:
+        for m in rf.m_range(e.start_month, rf.add_m(body.month, -1)):
+            if m not in have and m in shown:
+                db.add(ExpenseMonth(expense_id=e.id, month=m, amount=round(shown[m]["v"], 2)))
+    await db.execute(sa_delete(ExpenseMonth).where(ExpenseMonth.expense_id == e.id, ExpenseMonth.month >= body.month))
+    if e.how != "monthly":
+        e.raise_pct = 0
+    e.how, e.amount = "monthly", body.amount
+    if body.month < e.start_month:
+        e.start_month = body.month
+    await db.commit()
+    return success_response(data=await everything(db), message="Saved")
+
+
+@router.patch("/rows/{kind}/{rid}", response_model=APIResponse)
+async def edit_row(kind: str, rid: int, body: RowIn, db: AsyncSession = Depends(deps.get_db), user: User = Depends(ceo_only)) -> Any:
+    """Rename a line, or move an expense to another category, straight from the sheet."""
+    if kind not in ("expense", "product"):
+        raise HTTPException(status_code=404, detail="Unknown line.")
+    row = await get_or_404(db, Expense if kind == "expense" else Product, rid, "Line")
+    if body.name:
+        row.name = body.name.strip()
+    if kind == "expense" and body.category_id:
+        await get_or_404(db, ExpenseCategory, body.category_id, "Category")
+        row.category_id = body.category_id
+    await db.commit()
+    return success_response(data=await everything(db), message="Saved")

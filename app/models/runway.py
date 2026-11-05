@@ -73,7 +73,11 @@ class Product(Base):
 
     tracking = 'figures' (income changes month to month: enter "so far this month" figures
                           whenever you look, and month totals when a month closes),
-               'fixed'   (the same amount every month: a retainer, a subscription).
+               'fixed'   (the same amount every month: a retainer, a subscription),
+               'billed'  (billed once a month with client minimums, like GMDI: figures carry the
+                          product's own expected bill; see ProductClient),
+               'once'    (only the months something is typed in: onboarding fees, set-up fees).
+    A ProductMonth in a future month is the plan for that month, for any tracking.
     cost_label names the cost that grows with this product's revenue ("Bank charges" for GMDI);
     leave it empty when there is none.
     """
@@ -81,12 +85,33 @@ class Product(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(120), nullable=False)
-    tracking = Column(String(10), nullable=False, default="figures")
+    tracking = Column(String(10), nullable=False, default="figures")   # figures | fixed | billed | once
     cost_label = Column(String(80), nullable=True)
     amount = Column(MONEY, nullable=False, default=0)          # fixed products only
     start_month = Column(String(7), nullable=False)
     end_month = Column(String(7), nullable=True)
     sort_order = Column(Integer, nullable=False, default=0)
+    # Months between a month's bill and the money arriving. GMDI invoices each month on the 1st of
+    # the next and clients pay then, so 1; a product paid within the month is 0.
+    pay_delay = Column(Integer, nullable=False, default=0)
+
+
+class ProductClient(Base):
+    """A client of a billed-monthly product (GMDI) and its minimum monthly commitment.
+
+    Mirrors GMDI's billing rule: if a month's usage fees fall short of the minimum, the client is
+    billed the minimum instead (in full, even in a part first month); fixed monthly charges come on
+    top. The sum over live clients is the floor the forecast never goes below.
+    """
+    __tablename__ = "cos_fin_product_client"
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("cos_fin_product.id"), nullable=False, index=True)
+    name = Column(String(160), nullable=False)
+    minimum = Column(MONEY, nullable=False, default=0)    # minimum monthly bill, before GST
+    fixed = Column(MONEY, nullable=False, default=0)      # fixed monthly charges, before GST
+    start_month = Column(String(7), nullable=False)      # go-live month
+    end_month = Column(String(7), nullable=True)
 
 
 class ProductFigure(Base):
@@ -113,6 +138,22 @@ class ProductMonth(Base):
     cost = Column(MONEY, nullable=False, default=0)
 
 
+class ProductReceipt(Base):
+    """Money that actually reached the bank from a product in a month (what clients paid).
+
+    Expected money is the bill pay_delay months back; when a client pays less, late or ahead, the
+    CEO types what really came in. The difference is carried as "still owed" (or "paid ahead").
+    """
+    __tablename__ = "cos_fin_product_receipt"
+    __table_args__ = (UniqueConstraint("product_id", "month", name="uix_cos_fin_product_receipt"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("cos_fin_product.id"), nullable=False, index=True)
+    month = Column(String(7), nullable=False)
+    amount = Column(MONEY, nullable=False)
+    note = Column(String(200), nullable=True)
+
+
 class CapitalEntry(Base):
     """Money put into the company. A future date is a planned top-up."""
     __tablename__ = "cos_fin_capital"
@@ -134,6 +175,6 @@ class BankCheck(Base):
 
 RUNWAY_TABLES = [
     "cos_fin_settings", "cos_fin_category", "cos_fin_expense", "cos_fin_expense_month",
-    "cos_fin_product", "cos_fin_product_figure", "cos_fin_product_month",
-    "cos_fin_capital", "cos_fin_bank_check",
+    "cos_fin_product", "cos_fin_product_figure", "cos_fin_product_month", "cos_fin_product_client",
+    "cos_fin_capital", "cos_fin_bank_check", "cos_fin_product_receipt",
 ]

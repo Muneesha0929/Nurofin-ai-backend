@@ -6,8 +6,10 @@ Who can do what:
   - the person who suggested it, or the Director: edit the wording
   - anyone: link their own Task Center tasks to a feature (the Director can link any task); a link
     can be removed by the Director, the feature's author, the task's owner or whoever made it
-  - the Director (ceo / super_admin) only: move the status, always with the reason written down,
-    and pick the solution to build (its author is credited and told)
+  - the Director (ceo / super_admin) only: move the status, always with the reason written down
+  - the Director, or the HOD of a department the author belongs to: pick the solution to build
+    ("Go with this"; its author is credited and told) and keep the cost and profit estimate
+  - anyone: tag products, attach screenshots or documents (the uploader or the Director removes one)
 
 Nothing is ever deleted. Every change is written to cos_feature_event (append-only), with the old
 and new values, so the history explains itself to someone who joins later.
@@ -15,7 +17,8 @@ and new values, so the history explains itself to someone who joins later.
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy import String, cast, exists, func, or_
 from sqlalchemy.exc import IntegrityError
@@ -27,9 +30,10 @@ from app.core.responses import APIResponse, success_response
 from app.models.notification import Notification, NotificationTypeEnum
 from app.services.mentions import extract_mentioned_users
 from app.models.product_feature import (
-    FEATURE_SOURCES, FEATURE_STATUSES, ProductFeature, ProductFeatureEvent, ProductFeatureMeToo,
-    ProductFeatureSolution, ProductFeatureSolutionVote, ProductFeatureTask,
+    DEFAULT_PRODUCTS, FEATURE_SOURCES, FEATURE_STATUSES, AppProduct, ProductFeature, ProductFeatureAttachment, ProductFeatureCost,
+    ProductFeatureEvent, ProductFeatureMeToo, ProductFeatureProduct, ProductFeatureSolution, ProductFeatureSolutionVote, ProductFeatureTask,
 )
+from app.models.department_target import TargetDepartment, target_department_members
 from app.models.task import Task
 from app.models.user import User
 
@@ -54,6 +58,21 @@ def is_director(user: User) -> bool:
 
 def can_edit(user: User, f: ProductFeature) -> bool:
     return is_director(user) or f.created_by_id == user.id
+
+
+async def hod_of_author(db: AsyncSession, user: User, f: ProductFeature) -> bool:
+    """True if `user` heads a department the feature's author belongs to (or heads)."""
+    if f.created_by_id == user.id:
+        return bool((await db.execute(select(TargetDepartment.id).filter(
+            TargetDepartment.hod_id == user.id, TargetDepartment.is_deleted == False))).first())
+    member_of = select(target_department_members.c.department_id).where(target_department_members.c.user_id == f.created_by_id)
+    q = select(TargetDepartment.id).filter(TargetDepartment.is_deleted == False, TargetDepartment.hod_id == user.id,
+                                           or_(TargetDepartment.id.in_(member_of), TargetDepartment.hod_id == f.created_by_id))
+    return bool((await db.execute(q)).first())
+
+
+async def can_decide(db: AsyncSession, user: User, f: ProductFeature) -> bool:
+    return is_director(user) or await hod_of_author(db, user, f)
 
 
 def code(fid: int) -> str:
@@ -138,6 +157,62 @@ def summary(f: ProductFeature, who: Dict[int, Any], tasks: List[Dict[str, Any]],
     }
 
 
+# ----------------------------------------------------------------- products, money
+
+async def all_products(db: AsyncSession) -> List[Dict[str, Any]]:
+    rows = (await db.execute(select(AppProduct).filter(AppProduct.is_deleted == False).order_by(AppProduct.sort_order, AppProduct.id))).scalars().all()
+    if not rows:   # first use: the products the company builds today
+        for i, n in enumerate(DEFAULT_PRODUCTS):
+            db.add(AppProduct(name=n, sort_order=i))
+        await db.flush()
+        rows = (await db.execute(select(AppProduct).filter(AppProduct.is_deleted == False).order_by(AppProduct.sort_order, AppProduct.id))).scalars().all()
+    return [{"id": p.id, "name": p.name} for p in rows]
+
+
+async def products_of(db: AsyncSession, ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    if not ids:
+        return {}
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for fid, pid, name in (await db.execute(
+        select(ProductFeatureProduct.feature_id, AppProduct.id, AppProduct.name)
+        .join(AppProduct, AppProduct.id == ProductFeatureProduct.product_id)
+        .filter(ProductFeatureProduct.feature_id.in_(ids), AppProduct.is_deleted == False)
+        .order_by(AppProduct.sort_order, AppProduct.id))).all():
+        out.setdefault(fid, []).append({"id": pid, "name": name})
+    return out
+
+
+def money_totals(lines) -> Optional[Dict[str, Any]]:
+    """Cost and profit in plain numbers: what it takes once and each month, what it brings each
+    month, how many months until it pays for itself, and the result after a year."""
+    if not lines:
+        return None
+    get = lambda side, kind: sum(float(c.amount) for c in lines if c.side == side and c.kind == kind)
+    once_cost, month_cost = get("cost", "one_time"), get("cost", "monthly")
+    once_gain, month_gain = get("benefit", "one_time"), get("benefit", "monthly")
+    net_month = month_gain - month_cost
+    upfront = once_cost - once_gain
+    if upfront <= 0:
+        payback = 0.0 if net_month >= 0 else None
+    else:
+        payback = round(upfront / net_month, 1) if net_month > 0 else None
+    year = once_gain - once_cost + 12 * net_month
+    spent_year = once_cost + 12 * month_cost
+    return {"one_time_cost": once_cost, "monthly_cost": month_cost, "one_time_benefit": once_gain, "monthly_benefit": month_gain,
+            "net_monthly": net_month, "payback_months": payback, "net_first_year": year,
+            "return_first_year": round(year / spent_year * 100) if spent_year else None,
+            "has_benefit": any(c.side == "benefit" for c in lines)}
+
+
+async def cost_totals_of(db: AsyncSession, ids: List[int]) -> Dict[int, Optional[Dict[str, Any]]]:
+    if not ids:
+        return {}
+    by: Dict[int, list] = {}
+    for c in (await db.execute(select(ProductFeatureCost).filter(ProductFeatureCost.feature_id.in_(ids), ProductFeatureCost.is_deleted == False))).scalars().all():
+        by.setdefault(c.feature_id, []).append(c)
+    return {fid: money_totals(v) for fid, v in by.items()}
+
+
 # ----------------------------------------------------------------- schemas
 
 class FeatureIn(BaseModel):
@@ -165,6 +240,7 @@ class StatusIn(BaseModel):
 
 class TextIn(BaseModel):
     text: Optional[str] = Field(None, max_length=5000)
+    solution_id: Optional[int] = None   # a reply under one idea
 
 
 class SolutionIn(BaseModel):
@@ -179,6 +255,28 @@ class TaskLinkIn(BaseModel):
     task_id: int
 
 
+class ProductIn(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+
+
+class FeatureProductsIn(BaseModel):
+    product_ids: List[int] = Field(default_factory=list, max_length=50)
+
+
+class CostLineIn(BaseModel):
+    side: str = Field(..., pattern="^(cost|benefit)$")
+    label: str = Field(..., min_length=1, max_length=200)
+    kind: str = Field("one_time", pattern="^(one_time|monthly)$")
+    amount: Optional[float] = Field(None, ge=0, le=1e12)
+    days: Optional[float] = Field(None, ge=0, le=10000)
+    rate: Optional[float] = Field(None, ge=0, le=1e9)
+    note: Optional[str] = Field(None, max_length=300)
+
+
+class CostsIn(BaseModel):
+    lines: List[CostLineIn] = Field(default_factory=list, max_length=100)
+
+
 # ----------------------------------------------------------------- list + search
 
 @router.get("", response_model=APIResponse)
@@ -186,6 +284,7 @@ async def list_features(
     q: Optional[str] = Query(None, max_length=200),
     status: Optional[str] = None,
     area: Optional[str] = None,
+    product: Optional[int] = None,
     mine: bool = False,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
@@ -197,6 +296,8 @@ async def list_features(
         base = base.filter(ProductFeature.area == area)
     if mine:
         base = base.filter(ProductFeature.created_by_id == current_user.id)
+    if product:
+        base = base.filter(exists().where(ProductFeatureProduct.feature_id == ProductFeature.id, ProductFeatureProduct.product_id == product))
     term = (q or "").strip()
     if term:
         like = f"%{term}%"
@@ -246,11 +347,20 @@ async def list_features(
         select(ProductFeature.area).filter(ProductFeature.is_deleted == False, ProductFeature.area.isnot(None)).distinct()
     )).scalars().all() if a})
 
+    tags = await products_of(db, ids)
+    money = await cost_totals_of(db, ids)
+    out = []
+    for f in rows:
+        row = summary(f, who, tasks.get(f.id, []), tally.get(f.id, {}).get("me_too", 0),
+                      tally.get(f.id, {}).get("comment", 0), f.id in mine_too,
+                      tally.get(f.id, {}).get("solutions", 0), chosen_of(f))
+        row["products"] = tags.get(f.id, [])
+        row["money"] = money.get(f.id)
+        out.append(row)
     return success_response(data={
-        "features": [summary(f, who, tasks.get(f.id, []), tally.get(f.id, {}).get("me_too", 0),
-                             tally.get(f.id, {}).get("comment", 0), f.id in mine_too,
-                             tally.get(f.id, {}).get("solutions", 0), chosen_of(f)) for f in rows],
+        "features": out,
         "counts": counts, "total": len(everything), "areas": areas,
+        "products": await all_products(db),
         "is_director": is_director(current_user), "me": current_user.id,
     })
 
@@ -315,8 +425,31 @@ async def detail(db: AsyncSession, f: ProductFeature, user: User) -> Dict[str, A
         "me_too_people": [who[u] for u in me_too if u in who],
         "events": [{"id": e.id, "kind": e.kind, "user": who.get(e.user_id), "text": e.text, "data": e.data,
                     "created_at": _iso(e.created_at)} for e in events],
-        "permissions": {"can_edit": can_edit(user, f), "can_decide": is_director(user), "can_link": True},
+        "permissions": {"can_edit": can_edit(user, f), "can_decide": await can_decide(db, user, f), "can_link": True,
+                        "can_set_status": is_director(user)},
     })
+    # replies under an idea are comments that name it
+    replies: Dict[int, List[Dict[str, Any]]] = {}
+    for e in out["events"]:
+        if e["kind"] == "comment" and (e.get("data") or {}).get("solution_id"):
+            replies.setdefault(e["data"]["solution_id"], []).append(e)
+    for x in out["solutions_list"]:
+        x["replies"] = replies.get(x["id"], [])
+    out["products"] = (await products_of(db, [f.id])).get(f.id, [])
+    out["all_products"] = await all_products(db)
+    atts = (await db.execute(select(ProductFeatureAttachment).filter(
+        ProductFeatureAttachment.feature_id == f.id, ProductFeatureAttachment.is_deleted == False).order_by(ProductFeatureAttachment.id))).scalars().all()
+    upl = await people(db, [a.uploaded_by_id for a in atts])
+    out["attachments"] = [{"id": a.id, "filename": a.filename, "content_type": a.content_type, "size": a.size, "solution_id": a.solution_id,
+                           "is_image": a.content_type.startswith("image/"), "by": upl.get(a.uploaded_by_id), "created_at": _iso(a.created_at),
+                           "can_remove": is_director(user) or a.uploaded_by_id == user.id} for a in atts]
+    lines = (await db.execute(select(ProductFeatureCost).filter(ProductFeatureCost.feature_id == f.id, ProductFeatureCost.is_deleted == False)
+                              .order_by(ProductFeatureCost.sort_order, ProductFeatureCost.id))).scalars().all()
+    out["costs"] = {"lines": [{"id": c.id, "side": c.side, "label": c.label, "kind": c.kind, "amount": float(c.amount),
+                               "days": float(c.days) if c.days is not None else None, "rate": float(c.rate) if c.rate is not None else None,
+                               "note": c.note} for c in lines],
+                    "totals": money_totals(lines)}
+    out["permissions"]["can_cost"] = out["permissions"]["can_decide"] or f.created_by_id == user.id
     return out
 
 
@@ -348,6 +481,44 @@ async def create_feature(
             notify(db, uid, current_user, "New feature idea", f"{code(f.id)} · {f.title}", f.id)
     await db.commit()
     return success_response(data=await detail(db, f, current_user), message="Feature suggested")
+
+
+@router.get("/products", response_model=APIResponse)
+async def list_products(db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    out = await all_products(db)
+    await db.commit()
+    return success_response(data=out)
+
+
+async def can_manage_products(db: AsyncSession, user: User) -> bool:
+    if is_director(user):
+        return True
+    return bool((await db.execute(select(TargetDepartment.id).filter(TargetDepartment.hod_id == user.id, TargetDepartment.is_deleted == False))).first())
+
+
+@router.post("/products", response_model=APIResponse)
+async def add_product(body: ProductIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    if not await can_manage_products(db, current_user):
+        raise HTTPException(status_code=403, detail="The Director or an HOD adds products.")
+    name = _clean(body.name, 120)
+    existing = await all_products(db)
+    if any(p["name"].lower() == (name or "").lower() for p in existing):
+        raise HTTPException(status_code=409, detail="That product is already on the list.")
+    db.add(AppProduct(name=name, sort_order=len(existing)))
+    await db.commit()
+    return success_response(data=await all_products(db), message="Product added")
+
+
+@router.put("/products/{pid}", response_model=APIResponse)
+async def rename_product(pid: int, body: ProductIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    if not await can_manage_products(db, current_user):
+        raise HTTPException(status_code=403, detail="The Director or an HOD renames products.")
+    p = (await db.execute(select(AppProduct).filter(AppProduct.id == pid, AppProduct.is_deleted == False))).scalars().first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Product not found.")
+    p.name = _clean(body.name, 120)
+    await db.commit()
+    return success_response(data=await all_products(db), message="Product renamed")
 
 
 @router.get("/{fid}", response_model=APIResponse)
@@ -427,12 +598,21 @@ async def comment(
     text = _clean(body.text)
     if not text:
         raise HTTPException(status_code=422, detail="Write something first.")
-    log(db, f, current_user, "comment", text=text)
-    notify(db, f.created_by_id, current_user, "New comment on your idea", f"{code(f.id)} · {text[:140]}", f.id)
+    recipient_id = f.created_by_id
+    if body.solution_id:
+        sol = await get_solution(db, f, body.solution_id)
+        log(db, f, current_user, "comment", text=text, data={"solution_id": sol.id})
+        recipient_id = sol.created_by_id
+        if sol.created_by_id != current_user.id:
+            notify(db, sol.created_by_id, current_user, "Reply to your idea", f"{code(f.id)} · {text[:140]}", f.id)
+    else:
+        log(db, f, current_user, "comment", text=text)
+        notify(db, f.created_by_id, current_user, "New comment on your idea", f"{code(f.id)} · {text[:140]}", f.id)
+
     # Notify any teammates tagged with @mention
     mentioned = await extract_mentioned_users(db, text)
     for u in mentioned:
-        if u.id != current_user.id and u.id != f.created_by_id:
+        if u.id != current_user.id and u.id != recipient_id:
             notify(db, u.id, current_user, f"Tagged by {current_user.full_name or 'a teammate'}", f"{current_user.full_name or 'A teammate'} tagged you in {code(f.id)} ({f.title}): {text[:140]}", f.id)
     await db.commit()
     return success_response(data=await detail(db, f, current_user), message="Comment added")
@@ -538,10 +718,11 @@ async def choose_solution(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ):
-    """The Director picks the solution to build. Its author is credited on the feature and told."""
-    if not is_director(current_user):
-        raise HTTPException(status_code=403, detail="Only the Director picks the solution.")
+    """The Director, or the author's HOD, picks the solution to build. Its author is credited and told.
+    The Director can change an HOD's pick; the event log keeps both."""
     f = await get_feature(db, fid)
+    if not await can_decide(db, current_user, f):
+        raise HTTPException(status_code=403, detail="Only the Director or this person's HOD picks the solution.")
     s = await get_solution(db, f, sid)
     if f.chosen_solution_id == s.id:
         return success_response(data=await detail(db, f, current_user), message="Already chosen")
@@ -549,7 +730,8 @@ async def choose_solution(
     previous = f.chosen_solution_id
     f.chosen_solution_id = s.id
     log(db, f, current_user, "solution_chosen", text=_clean(body.note),
-        data={"solution_id": s.id, "by": author["name"] if author else None, "solution": s.text[:300], "replaced": previous})
+        data={"solution_id": s.id, "by": author["name"] if author else None, "solution": s.text[:300], "replaced": previous,
+              "as": "Director" if is_director(current_user) else "HOD"})
     notify(db, s.created_by_id, current_user, "Your solution was chosen",
            f"{code(f.id)} · {f.title}: we're going with your idea. Thank you!", f.id)
     await db.commit()
@@ -622,3 +804,135 @@ async def unlink_task(
         log(db, f, current_user, "task_unlinked", data={"task_id": task_id, "title": title})
         await db.commit()
     return success_response(data=await detail(db, f, current_user), message="Task unlinked")
+
+
+# ----------------------------------------------------------------- products on a feature
+
+@router.put("/{fid}/products", response_model=APIResponse)
+async def set_products(fid: int, body: FeatureProductsIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    f = await get_feature(db, fid)
+    if not (can_edit(current_user, f) or await hod_of_author(db, current_user, f)):
+        raise HTTPException(status_code=403, detail="The author, their HOD or the Director tags products.")
+    valid = {p["id"]: p["name"] for p in await all_products(db)}
+    want = [i for i in dict.fromkeys(body.product_ids) if i in valid]
+    have = (await db.execute(select(ProductFeatureProduct).filter(ProductFeatureProduct.feature_id == f.id))).scalars().all()
+    before = sorted(valid.get(x.product_id, "?") for x in have)
+    for x in have:
+        if x.product_id not in want:
+            await db.delete(x)
+    for i in want:
+        if all(x.product_id != i for x in have):
+            db.add(ProductFeatureProduct(feature_id=f.id, product_id=i))
+    after = sorted(valid[i] for i in want)
+    if before != after:
+        log(db, f, current_user, "edited", data={"field": "products", "old": ", ".join(before) or None, "new": ", ".join(after) or None})
+    await db.commit()
+    return success_response(data=await detail(db, f, current_user), message="Products saved")
+
+
+# ----------------------------------------------------------------- screenshots and documents
+
+MAX_ATTACHMENT = 10 * 1024 * 1024
+ALLOWED_TYPES = ("image/", "application/pdf", "text/plain", "text/csv",
+                 "application/vnd.openxmlformats-officedocument", "application/msword", "application/vnd.ms-excel")
+
+
+@router.post("/{fid}/attachments", response_model=APIResponse)
+async def add_attachment(
+    fid: int, file: UploadFile = File(...), solution_id: Optional[int] = Form(None),
+    db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+):
+    from app.services.s3 import upload_file_to_s3
+    import io
+    f = await get_feature(db, fid)
+    if solution_id:
+        await get_solution(db, f, solution_id)
+    ctype = (file.content_type or "application/octet-stream").lower()
+    if not any(ctype.startswith(t) for t in ALLOWED_TYPES):
+        raise HTTPException(status_code=415, detail="Attach a screenshot, a PDF, a Word or Excel file, or a text file.")
+    raw = await file.read(MAX_ATTACHMENT + 1)
+    if len(raw) > MAX_ATTACHMENT:
+        raise HTTPException(status_code=413, detail="That file is over 10 MB.")
+    if not raw:
+        raise HTTPException(status_code=422, detail="That file is empty.")
+    name = (file.filename or "attachment").replace("/", "_").replace("\\", "_")[-200:]
+    key = upload_file_to_s3(io.BytesIO(raw), f"feature-{f.id}-{name}", ctype)   # flat name: the local fallback writes a plain file
+    a = ProductFeatureAttachment(feature_id=f.id, solution_id=solution_id, filename=name, content_type=ctype, size=len(raw),
+                                 storage_key=key, uploaded_by_id=current_user.id)
+    db.add(a)
+    await db.flush()
+    log(db, f, current_user, "attachment", text=name, data={"attachment_id": a.id, "solution_id": solution_id})
+    await db.commit()
+    return success_response(data=await detail(db, f, current_user), message="Attached")
+
+
+@router.get("/{fid}/attachments/{aid}/file")
+async def attachment_file(fid: int, aid: int, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    """The file itself, streamed through the API so it needs the same sign-in as the page."""
+    import os
+    from app.services.s3 import UPLOAD_DIR, get_s3_client
+    from app.core.config import settings
+    a = (await db.execute(select(ProductFeatureAttachment).filter(
+        ProductFeatureAttachment.id == aid, ProductFeatureAttachment.feature_id == fid, ProductFeatureAttachment.is_deleted == False))).scalars().first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+    if a.storage_key.startswith("local/"):
+        path = os.path.join(UPLOAD_DIR, a.storage_key[len("local/"):])
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="The file is missing on the server.")
+        with open(path, "rb") as fh:
+            body = fh.read()
+    else:
+        client = get_s3_client()
+        if not client:
+            raise HTTPException(status_code=503, detail="File storage is not configured.")
+        body = client.get_object(Bucket=settings.AWS_S3_BUCKET_NAME, Key=a.storage_key)["Body"].read()
+    disp = "inline" if a.content_type.startswith("image/") or a.content_type == "application/pdf" else "attachment"
+    safe = a.filename.replace('"', "")
+    return Response(content=body, media_type=a.content_type, headers={"Content-Disposition": f'{disp}; filename="{safe}"',
+                                                                      "Cache-Control": "private, max-age=3600"})
+
+
+@router.delete("/{fid}/attachments/{aid}", response_model=APIResponse)
+async def remove_attachment(fid: int, aid: int, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    f = await get_feature(db, fid)
+    a = (await db.execute(select(ProductFeatureAttachment).filter(
+        ProductFeatureAttachment.id == aid, ProductFeatureAttachment.feature_id == fid, ProductFeatureAttachment.is_deleted == False))).scalars().first()
+    if not a:
+        raise HTTPException(status_code=404, detail="Attachment not found.")
+    if not (is_director(current_user) or a.uploaded_by_id == current_user.id):
+        raise HTTPException(status_code=403, detail="Only whoever attached it, or the Director, can remove it.")
+    a.is_deleted = True   # the file and its history stay; it just stops showing
+    log(db, f, current_user, "attachment_removed", text=a.filename, data={"attachment_id": a.id})
+    await db.commit()
+    return success_response(data=await detail(db, f, current_user), message="Removed")
+
+
+# ----------------------------------------------------------------- cost and profit
+
+@router.put("/{fid}/costs", response_model=APIResponse)
+async def set_costs(fid: int, body: CostsIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user)):
+    """Replace the estimate. People's time can be days x rate per day; the amount is then worked out."""
+    f = await get_feature(db, fid)
+    if not (f.created_by_id == current_user.id or await can_decide(db, current_user, f)):
+        raise HTTPException(status_code=403, detail="The author, their HOD or the Director keeps the estimate.")
+    before = money_totals((await db.execute(select(ProductFeatureCost).filter(
+        ProductFeatureCost.feature_id == f.id, ProductFeatureCost.is_deleted == False))).scalars().all())
+    for c in (await db.execute(select(ProductFeatureCost).filter(ProductFeatureCost.feature_id == f.id))).scalars().all():
+        await db.delete(c)
+    new_rows = []
+    for i, line in enumerate(body.lines):
+        amount = line.amount
+        if line.days is not None and line.rate is not None:
+            amount = round(line.days * line.rate, 2)
+        if amount is None:
+            raise HTTPException(status_code=422, detail=f"“{line.label}” needs an amount, or days and a rate.")
+        row = ProductFeatureCost(feature_id=f.id, side=line.side, label=_clean(line.label, 200), kind=line.kind, amount=amount,
+                                 days=line.days, rate=line.rate, note=_clean(line.note, 300), sort_order=i)
+        db.add(row)
+        new_rows.append(row)
+    await db.flush()
+    after = money_totals(new_rows)
+    log(db, f, current_user, "costs", data={"before": before, "after": after})
+    await db.commit()
+    return success_response(data=await detail(db, f, current_user), message="Estimate saved")

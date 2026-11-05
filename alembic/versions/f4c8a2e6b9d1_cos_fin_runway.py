@@ -24,7 +24,9 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     from app.db.base_class import Base
     import app.models  # noqa: F401  (registers the models on Base.metadata)
-    from app.models.runway import RUNWAY_TABLES
+    # the nine tables this revision added (frozen: later revisions add their own)
+    RUNWAY_TABLES = ["cos_fin_settings", "cos_fin_category", "cos_fin_expense", "cos_fin_expense_month",
+                     "cos_fin_product", "cos_fin_product_figure", "cos_fin_product_month", "cos_fin_capital", "cos_fin_bank_check"]
 
     bind = op.get_bind()
     insp = sa.inspect(bind)
@@ -41,6 +43,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    from app.models.runway import RUNWAY_TABLES
+    RUNWAY_TABLES = ["cos_fin_settings", "cos_fin_category", "cos_fin_expense", "cos_fin_expense_month",
+                     "cos_fin_product", "cos_fin_product_figure", "cos_fin_product_month", "cos_fin_capital", "cos_fin_bank_check"]
     for name in reversed(RUNWAY_TABLES):
         op.drop_table(name)

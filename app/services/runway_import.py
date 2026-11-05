@@ -161,7 +161,7 @@ def template_monthly(data: Dict[str, Any], today: date) -> str:
         w.writerow(["Expense", e["name"], cats.get(e["category_id"], ""), HOW_LABEL[e["how"]], fmt(e["raise"]) if e["how"] == "monthly" else ""]
                    + [fmt(e["months"].get(m)) for m in months])
     for p in data["products"]:
-        if p["tracking"] != "figures":
+        if p["tracking"] == "fixed":
             continue
         w.writerow(["Income", p["name"], "", "", ""] + [fmt((p["months"].get(m) or {}).get("revenue")) for m in months])
         if p.get("cost_label"):
@@ -179,11 +179,12 @@ def template_figures(data: Dict[str, Any]) -> str:
     out = io.StringIO()
     w = csv.writer(out)
     w.writerow(["# Runway: product figures. One row each time you looked at a product's dashboard: the date and its revenue so far that month."])
+    w.writerow(["# For GMDI, put GMDI's expected bill for the month (Profit Outlook) in the last column; revenue so far can then stay empty."])
     w.writerow(["# Dates as 16/10/2026 or 2026-10-16. Any gap between dates is fine. Lines starting with # are ignored."])
     w.writerow(["Product", "Date", "Revenue so far this month", "Cost so far this month", "Product's month-end forecast"])
     fmt = lambda v: "" if v is None else (str(int(v)) if float(v).is_integer() else str(v))
     for p in data["products"]:
-        if p["tracking"] != "figures":
+        if p["tracking"] == "fixed":
             continue
         for f in p["figures"]:
             w.writerow([p["name"], f["day"], fmt(f["revenue"]), fmt(f["cost"]), fmt(f["forecast"])])
@@ -384,7 +385,7 @@ def _parse_figures(rows, data, today, plan, err) -> None:
         err(1, None, "The figures template needs Date and Revenue columns.")
         return
     prods = {p["name"].strip().lower(): p for p in data["products"]}
-    only = [p for p in data["products"] if p["tracking"] == "figures"]
+    only = [p for p in data["products"] if p["tracking"] != "fixed"]
     new_prods: Dict[str, Dict[str, Any]] = {}
     merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for p in only:
@@ -412,11 +413,13 @@ def _parse_figures(rows, data, today, plan, err) -> None:
             err(r_i, "Date", f"{day} is before the books start.")
             continue
         rev, pr = parse_amount(cell(c_r))
+        cost, pc = parse_amount(cell(c_c)) if c_c is not None else (None, None)
+        fc, pf = parse_amount(cell(c_f)) if c_f is not None else (None, None)
+        if not pr and rev is None and fc is not None and p and p["tracking"] == "billed":
+            rev = 0.0   # a billed product's figure can be just its expected bill
         if pr or rev is None:
             err(r_i, "Revenue", f"Revenue {pr}." if pr else "Revenue is empty.")
             continue
-        cost, pc = parse_amount(cell(c_c)) if c_c is not None else (None, None)
-        fc, pf = parse_amount(cell(c_f)) if c_f is not None else (None, None)
         if pc or pf:
             err(r_i, "Cost" if pc else "Forecast", f"The amount {pc or pf}.")
             continue
@@ -440,7 +443,7 @@ def _parse_figures(rows, data, today, plan, err) -> None:
     for (pn, m), items in by_month.items():
         items.sort()
         for (d0, a), (d1, b) in zip(items, items[1:]):
-            if b["revenue"] < a["revenue"] and (a["row"] or b["row"]):
+            if b["revenue"] and b["revenue"] < a["revenue"] and (a["row"] or b["row"]):
                 err(b["row"] or a["row"], "Revenue", f"{d1}: revenue so far is lower than on {d0}. It can only go up within a month.")
     plan["products"] = list(new_prods.values())
 
