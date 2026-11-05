@@ -127,6 +127,10 @@ async def ensure_columns(db) -> None:
             "ALTER TABLE notification ADD COLUMN IF NOT EXISTS link VARCHAR",
             "ALTER TABLE issue ADD COLUMN IF NOT EXISTS scheduled_date VARCHAR",
             "ALTER TABLE issue ADD COLUMN IF NOT EXISTS actual_completion_date VARCHAR",
+            "ALTER TABLE task ADD COLUMN IF NOT EXISTS extended_time FLOAT",
+            "ALTER TABLE task ADD COLUMN IF NOT EXISTS pushed_to_next_day BOOLEAN DEFAULT FALSE",
+            "ALTER TABLE task ADD COLUMN IF NOT EXISTS actual_completion_date VARCHAR",
+            "ALTER TABLE task ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR",
         ]
         for stmt in stmts:
             await db.execute(text(stmt))

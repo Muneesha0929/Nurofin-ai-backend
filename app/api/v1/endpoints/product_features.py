@@ -25,6 +25,7 @@ from sqlalchemy.future import select
 from app.api import deps
 from app.core.responses import APIResponse, success_response
 from app.models.notification import Notification, NotificationTypeEnum
+from app.services.mentions import extract_mentioned_users
 from app.models.product_feature import (
     FEATURE_SOURCES, FEATURE_STATUSES, ProductFeature, ProductFeatureEvent, ProductFeatureMeToo,
     ProductFeatureSolution, ProductFeatureSolutionVote, ProductFeatureTask,
@@ -428,6 +429,11 @@ async def comment(
         raise HTTPException(status_code=422, detail="Write something first.")
     log(db, f, current_user, "comment", text=text)
     notify(db, f.created_by_id, current_user, "New comment on your idea", f"{code(f.id)} · {text[:140]}", f.id)
+    # Notify any teammates tagged with @mention
+    mentioned = await extract_mentioned_users(db, text)
+    for u in mentioned:
+        if u.id != current_user.id and u.id != f.created_by_id:
+            notify(db, u.id, current_user, f"Tagged by {current_user.full_name or 'a teammate'}", f"{current_user.full_name or 'A teammate'} tagged you in {code(f.id)} ({f.title}): {text[:140]}", f.id)
     await db.commit()
     return success_response(data=await detail(db, f, current_user), message="Comment added")
 

@@ -2,6 +2,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
+from sqlalchemy import update
 
 from app.api import deps
 from app.models.notification import Notification
@@ -47,6 +48,34 @@ async def create_notification(
         data=NotificationSchema.from_orm(db_notif).dict(),
         message="Notification created successfully"
     )
+
+@router.put("/read-all", response_model=APIResponse)
+async def mark_all_as_read(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    await db.execute(
+        update(Notification)
+        .filter(Notification.user_id == current_user.id, Notification.is_read == False)
+        .values(is_read=True)
+    )
+    await db.commit()
+    return success_response(message="All notifications marked as read")
+
+@router.delete("/clear-all", response_model=APIResponse)
+async def clear_all_notifications(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    await db.execute(
+        update(Notification)
+        .filter(Notification.user_id == current_user.id)
+        .values(is_deleted=True, is_read=True)
+    )
+    await db.commit()
+    return success_response(message="All notifications cleared")
 
 @router.put("/{id}/read", response_model=APIResponse)
 async def mark_as_read(

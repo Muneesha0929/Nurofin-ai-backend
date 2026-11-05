@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean
+from sqlalchemy.sql import func
 from app.db.base_class import Base
 
 
@@ -11,3 +12,6 @@ class TaskComment(Base):
     content = Column(Text, nullable=False)
     parent_id = Column(Integer, ForeignKey("taskcomment.id"), nullable=True)
     attachments = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+    is_deleted = Column(Boolean, default=False)

@@ -1,4 +1,9 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, UploadFile, File
+from pydantic import BaseModel
+import json
+from app.models.task_comment import TaskComment
+from app.services.mentions import extract_mentioned_users
+from app.services.s3 import upload_file_to_s3, get_presigned_url
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, aliased
 from sqlalchemy import func, or_, case, exists, select, update
@@ -484,6 +489,19 @@ async def create_task(
     if parent_id:
         await _update_parent_task(db, parent_id, current_user.id)
         await _add_history(db, parent_id, "subtask_added", f"Subtask '{title}' added to Main Task", user_id=current_user.id)
+
+    # Notify users mentioned in description
+    if actual_description:
+        mentioned = await extract_mentioned_users(db, actual_description)
+        for u in mentioned:
+            if u.id != current_user.id:
+                db.add(Notification(
+                    title=f"Tagged in task by {current_user.full_name or 'a teammate'}",
+                    message=f"{current_user.full_name or 'A teammate'} tagged you in task '{task.title}': {actual_description[:120]}",
+                    type=NotificationTypeEnum.project_update,
+                    user_id=u.id,
+                    link=f"/workcenter?task={task.id}&tab=updates&focus=reply",
+                ))
     await db.commit()
     await _recalculate_project_progress(db, task.project_id)
     if task.parent_id:
@@ -583,6 +601,19 @@ async def update_task(
         
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
+
+    # Notify users mentioned in description if description was updated
+    if description is not None and description.strip():
+        mentioned = await extract_mentioned_users(db, description)
+        for u in mentioned:
+            if u.id != current_user.id:
+                db.add(Notification(
+                    title="Tagged in task description",
+                    message=f"{current_user.full_name or 'A teammate'} tagged you in task '{task.title}': {description[:120]}",
+                    type=NotificationTypeEnum.project_update,
+                    user_id=u.id,
+                    link=f"/workcenter?task={task.id}&tab=updates&focus=reply",
+                ))
         
     await db.commit()
     
@@ -821,3 +852,229 @@ async def get_performance(
         "stats": {"totalTasks": total, "completedTasks": completed, "overdueTasks": overdue, "completionPct": pct, "transfersOut": t_out, "transfersIn": t_in},
         "tasks": tasks,
     })
+
+
+# ─── TASK COMMENTS & FOLLOW-UPS ───────────────────────────────────────────────
+
+class TaskCommentCreate(BaseModel):
+    content: str
+    parent_id: Optional[int] = None
+    is_followup_completed: Optional[bool] = False
+    attachments: Optional[List[dict]] = None
+
+
+@router.get("/{task_id}/comments")
+async def get_task_comments(
+    task_id: int,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    task_r = await db.execute(select(Task).filter(Task.id == task_id, Task.is_deleted == False))
+    task = task_r.scalars().first()
+    if not task:
+        return error_response(message="Task not found")
+
+    comments_r = await db.execute(
+        select(TaskComment, User)
+        .outerjoin(User, TaskComment.user_id == User.id)
+        .filter(TaskComment.task_id == task_id, TaskComment.is_deleted == False)
+        .order_by(TaskComment.created_at.asc(), TaskComment.id.asc())
+    )
+    rows = comments_r.all()
+
+    comments_map = {}
+    root_comments = []
+
+    for comment, user in rows:
+        attachments_data = []
+        is_followup = False
+        if comment.attachments:
+            try:
+                parsed = json.loads(comment.attachments)
+                if isinstance(parsed, dict):
+                    attachments_data = parsed.get("files", [])
+                    is_followup = parsed.get("is_followup_completed", False)
+                elif isinstance(parsed, list):
+                    attachments_data = parsed
+            except Exception:
+                attachments_data = [{"name": "Attachment", "url": comment.attachments}]
+
+        c_dict = {
+            "id": comment.id,
+            "task_id": comment.task_id,
+            "user_id": comment.user_id,
+            "user_name": user.full_name if user else "Unknown User",
+            "user_avatar": user.profile_picture if user else None,
+            "user_role": user.role if user else None,
+            "content": comment.content,
+            "parent_id": comment.parent_id,
+            "attachments": attachments_data,
+            "is_followup_completed": is_followup,
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+            "replies": [],
+        }
+        comments_map[comment.id] = c_dict
+
+    for cid, c_dict in comments_map.items():
+        pid = c_dict["parent_id"]
+        if pid and pid in comments_map:
+            comments_map[pid]["replies"].append(c_dict)
+        else:
+            root_comments.append(c_dict)
+
+    return success_response(data=root_comments)
+
+
+@router.post("/{task_id}/comments")
+async def create_task_comment(
+    task_id: int,
+    body: TaskCommentCreate,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    task_r = await db.execute(select(Task).filter(Task.id == task_id, Task.is_deleted == False))
+    task = task_r.scalars().first()
+    if not task:
+        return error_response(message="Task not found")
+
+    content = (body.content or "").strip()
+    if not content:
+        return error_response(message="Comment content cannot be empty")
+
+    attach_dict = {
+        "files": body.attachments or [],
+        "is_followup_completed": bool(body.is_followup_completed),
+    }
+    attach_json = json.dumps(attach_dict)
+
+    comment = TaskComment(
+        task_id=task.id,
+        user_id=current_user.id,
+        content=content,
+        parent_id=body.parent_id,
+        attachments=attach_json,
+    )
+    db.add(comment)
+    await db.flush()
+
+    # Record history if follow-up is completed
+    if body.is_followup_completed:
+        await _add_history(
+            db, task.id, "followup_completed",
+            f"{current_user.full_name or 'User'} marked follow-up completed: {content[:80]}",
+            user_id=current_user.id
+        )
+
+    # Determine notification recipients for this update / follow-up
+    recipients = set()
+    if task.assigned_by_id and task.assigned_by_id != current_user.id:
+        recipients.add(task.assigned_by_id)
+    if task.assigned_to_id and task.assigned_to_id != current_user.id:
+        recipients.add(task.assigned_to_id)
+
+    # Prior commenters on this task
+    prior_comments = await db.execute(
+        select(TaskComment.user_id).filter(TaskComment.task_id == task.id, TaskComment.user_id != current_user.id)
+    )
+    for (p_uid,) in prior_comments.all():
+        if p_uid:
+            recipients.add(p_uid)
+
+    # Prior history actors (e.g. tagger/assigner)
+    prior_hist = await db.execute(
+        select(TaskHistory.user_id).filter(TaskHistory.task_id == task.id, TaskHistory.user_id.isnot(None), TaskHistory.user_id != current_user.id)
+    )
+    for (h_uid,) in prior_hist.all():
+        if h_uid:
+            recipients.add(h_uid)
+
+    # Anyone mentioned in task description
+    if task.description and "@" in task.description:
+        desc_mentioned = await extract_mentioned_users(db, task.description)
+        for u in desc_mentioned:
+            if u.id != current_user.id:
+                recipients.add(u.id)
+
+    # Parent comment author if this is a reply
+    if body.parent_id:
+        parent_r = await db.execute(select(TaskComment).filter(TaskComment.id == body.parent_id))
+        parent_comment = parent_r.scalars().first()
+        if parent_comment and parent_comment.user_id != current_user.id:
+            recipients.add(parent_comment.user_id)
+
+    # Mention notifications for any users tagged with @ in this comment
+    content_mentioned = await extract_mentioned_users(db, content)
+    content_mentioned_ids = {u.id for u in content_mentioned if u.id != current_user.id}
+
+    for r_id in recipients:
+        if r_id in content_mentioned_ids:
+            continue
+        if body.is_followup_completed:
+            db.add(Notification(
+                title=f"Follow-up completed on '{task.title}'",
+                message=f"{current_user.full_name or 'A teammate'} completed the follow-up: {content[:140]}",
+                type=NotificationTypeEnum.project_update,
+                user_id=r_id,
+                link=f"/workcenter?task={task.id}&tab=updates",
+            ))
+        else:
+            db.add(Notification(
+                title=f"New follow-up update on '{task.title}'",
+                message=f"{current_user.full_name or 'A teammate'} posted a follow-up: {content[:140]}",
+                type=NotificationTypeEnum.project_update,
+                user_id=r_id,
+                link=f"/workcenter?task={task.id}&tab=updates",
+            ))
+
+    for u in content_mentioned:
+        if u.id != current_user.id:
+            db.add(Notification(
+                title=f"Tagged by {current_user.full_name or 'a teammate'}",
+                message=f"{current_user.full_name or 'A teammate'} tagged you in an update on '{task.title}': {content[:140]}",
+                type=NotificationTypeEnum.project_update,
+                user_id=u.id,
+                link=f"/workcenter?task={task.id}&tab=updates",
+            ))
+
+    await db.commit()
+    await db.refresh(comment)
+
+    return success_response(
+        data={
+            "id": comment.id,
+            "task_id": comment.task_id,
+            "user_id": comment.user_id,
+            "user_name": current_user.full_name,
+            "user_avatar": current_user.profile_picture,
+            "user_role": current_user.role,
+            "content": comment.content,
+            "parent_id": comment.parent_id,
+            "attachments": attach_dict["files"],
+            "is_followup_completed": attach_dict["is_followup_completed"],
+            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+            "replies": [],
+        },
+        message="Update posted successfully"
+    )
+
+
+@router.post("/{task_id}/comments/upload")
+async def upload_task_comment_attachment(
+    task_id: int,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    task_r = await db.execute(select(Task).filter(Task.id == task_id, Task.is_deleted == False))
+    task = task_r.scalars().first()
+    if not task:
+        return error_response(message="Task not found")
+
+    s3_key = upload_file_to_s3(file.file, file.filename, file.content_type or "application/octet-stream")
+    file_url = get_presigned_url(s3_key)
+    return success_response(data={
+        "filename": file.filename,
+        "s3_key": s3_key,
+        "url": file_url,
+        "content_type": file.content_type,
+    }, message="File uploaded successfully")
