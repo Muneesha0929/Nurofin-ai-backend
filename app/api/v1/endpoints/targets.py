@@ -93,7 +93,7 @@ def prepare_target_response(target: Target, current_user: User, scores: List[Tar
         "month": target.month,
         "is_global": target.is_global,
         "is_completed": target.is_completed,
-        "completed_at": target.completed_at,
+        "completed_at": (target.completed_at.isoformat() + "Z") if getattr(target, "completed_at", None) else None,
         "average_score": average_score,
         "score_count": score_count,
         "my_score": my_score,
@@ -175,8 +175,8 @@ async def update_target(
     if not target:
         raise HTTPException(status_code=404, detail="Target not found")
         
-    if target.user_id != current_user.id and not can_manage_all_targets(current_user):
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+    # Anyone who has access can update anything in target space
+    pass
 
     if target_in.title is not None:
         target.title = target_in.title

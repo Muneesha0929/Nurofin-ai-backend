@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, aliased
 from sqlalchemy import func, or_, case, exists, select, update
 from typing import Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.api import deps
 from app.models.user import User
@@ -21,6 +21,20 @@ from app.models.notification import Notification, NotificationTypeEnum
 from app.core.responses import success_response, error_response
 
 router = APIRouter()
+
+def _iso_utc(dt):
+    if not dt:
+        return None
+    # If dt was stored in local IST (more than 15 minutes ahead of current UTC),
+    # adjust back to UTC by subtracting 5 hours 30 minutes before appending 'Z'
+    now_utc = datetime.utcnow()
+    if dt > now_utc + timedelta(minutes=15):
+        dt = dt - timedelta(hours=5, minutes=30)
+    s = dt.isoformat()
+    if not s.endswith("Z") and "+" not in s:
+        s += "Z"
+    return s
+
 
 
 async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True, cache: dict = None, _depth: int = 0) -> dict:
@@ -118,7 +132,7 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "project_name": project.name if project else None,
         "parent_id": t.parent_id, "quarter_id": t.quarter_id,
         "meeting_id": t.meeting_id, "subtasks": subtasks,
-        "created_at": t.created_at.isoformat() if t.created_at else None,
+        "created_at": _iso_utc(t.created_at),
         "transfer_date": transfer_date,
         "transfer_to_name": transfer_to_name,
         "actual_completion_date": t.actual_completion_date,
@@ -394,7 +408,7 @@ async def get_insights(
             "task_id": h.task_id, "task_title": task.title if task else None,
             "user_name": user.full_name if user else None,
             "user_avatar": user.profile_picture if user else None,
-            "created_at": h.created_at.isoformat() if h.created_at else None,
+            "created_at": _iso_utc(h.created_at),
         })
 
     perf_q = select(
@@ -485,7 +499,7 @@ async def create_task(
     if assigned_to_id:
         await _add_history(db, task.id, "assigned", f"Assigned to user {assigned_to_id}", user_id=current_user.id)
         db.add(Notification(title="New task assigned", message=f"You have been assigned: {title}",
-                           type=NotificationTypeEnum.task_assigned, user_id=assigned_to_id, link=f"/tasks?id={task.id}"))
+                           type=NotificationTypeEnum.task_assigned, user_id=assigned_to_id, link=f"/workcenter?task={task.id}&tab=updates"))
     if parent_id:
         await _update_parent_task(db, parent_id, current_user.id)
         await _add_history(db, parent_id, "subtask_added", f"Subtask '{title}' added to Main Task", user_id=current_user.id)
@@ -585,7 +599,7 @@ async def update_task(
             await _add_history(db, task_id, "assigned", "Reassigned", old_val=str(old_a), new_val=str(actual_assignee_id), user_id=current_user.id)
             if actual_assignee_id:
                 db.add(Notification(title="Task assigned", message=f"You have been assigned: {task.title}",
-                                   type=NotificationTypeEnum.task_assigned, user_id=actual_assignee_id, link=f"/tasks?id={task_id}"))
+                                   type=NotificationTypeEnum.task_assigned, user_id=actual_assignee_id, link=f"/workcenter?task={task_id}&tab=updates"))
                                    
     if reviewer_id is not None:
         task.reviewer_id = None if reviewer_id == 0 else reviewer_id
@@ -727,7 +741,7 @@ async def get_history(
             "old_value": e.old_value, "new_value": e.new_value,
             "user_name": user.full_name if user else None,
             "user_avatar": user.profile_picture if user else None,
-            "created_at": e.created_at.isoformat() if e.created_at else None,
+            "created_at": _iso_utc(e.created_at),
         })
     return success_response(data=result)
 
@@ -754,7 +768,7 @@ async def transfer_task(
     await _add_history(db, task_id, "transferred", f"Transferred from {from_id} to {to_user_id}",
                        old_val=str(from_id), new_val=str(to_user_id), user_id=current_user.id)
     db.add(Notification(title="Task transferred to you", message=f"You received: {task.title}",
-                       type=NotificationTypeEnum.task_assigned, user_id=to_user_id, link=f"/tasks?id={task_id}"))
+                       type=NotificationTypeEnum.task_assigned, user_id=to_user_id, link=f"/workcenter?task={task_id}&tab=updates"))
     await db.commit()
     await db.refresh(transfer)
     return success_response(message="Task transferred", data={"transfer_id": transfer.id})
@@ -776,7 +790,7 @@ async def get_transfers(
             "reason": t.reason, "current_progress": t.current_progress,
             "remaining_work": t.remaining_work, "new_deadline": t.new_deadline,
             "transfer_notes": t.transfer_notes, "status": t.status.value if t.status else "pending",
-            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "created_at": _iso_utc(t.created_at),
         })
     return success_response(data=result)
 
@@ -899,6 +913,17 @@ async def get_task_comments(
             except Exception:
                 attachments_data = [{"name": "Attachment", "url": comment.attachments}]
 
+        completed_by_name = None
+        completed_at = None
+        if comment.attachments:
+            try:
+                parsed_att = json.loads(comment.attachments)
+                if isinstance(parsed_att, dict):
+                    completed_by_name = parsed_att.get("completed_by_name")
+                    completed_at = parsed_att.get("completed_at")
+            except Exception:
+                pass
+
         c_dict = {
             "id": comment.id,
             "task_id": comment.task_id,
@@ -910,7 +935,9 @@ async def get_task_comments(
             "parent_id": comment.parent_id,
             "attachments": attachments_data,
             "is_followup_completed": is_followup,
-            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+            "completed_by_name": completed_by_name,
+            "completed_at": completed_at,
+            "created_at": _iso_utc(comment.created_at),
             "replies": [],
         }
         comments_map[comment.id] = c_dict
@@ -944,15 +971,21 @@ async def create_task_comment(
     attach_dict = {
         "files": body.attachments or [],
         "is_followup_completed": bool(body.is_followup_completed),
+        "completed_by_id": current_user.id if body.is_followup_completed else None,
+        "completed_by_name": (current_user.full_name or "Teammate") if body.is_followup_completed else None,
+        "completed_at": _iso_utc(datetime.utcnow()) if body.is_followup_completed else None,
     }
     attach_json = json.dumps(attach_dict)
 
+    now_utc = datetime.utcnow()
     comment = TaskComment(
         task_id=task.id,
         user_id=current_user.id,
         content=content,
         parent_id=body.parent_id,
         attachments=attach_json,
+        created_at=now_utc,
+        updated_at=now_utc,
     )
     db.add(comment)
     await db.flush()
@@ -982,7 +1015,7 @@ async def create_task_comment(
 
     # Prior history actors (e.g. tagger/assigner)
     prior_hist = await db.execute(
-        select(TaskHistory.user_id).filter(TaskHistory.task_id == task.id, TaskHistory.user_id.isnot(None), TaskHistory.user_id != current_user.id)
+        select(TaskHistory.performed_by_id).filter(TaskHistory.task_id == task.id, TaskHistory.performed_by_id.isnot(None), TaskHistory.performed_by_id != current_user.id)
     )
     for (h_uid,) in prior_hist.all():
         if h_uid:
@@ -1051,10 +1084,120 @@ async def create_task_comment(
             "parent_id": comment.parent_id,
             "attachments": attach_dict["files"],
             "is_followup_completed": attach_dict["is_followup_completed"],
-            "created_at": comment.created_at.isoformat() if comment.created_at else None,
+            "created_at": _iso_utc(comment.created_at), "completed_by_name": attach_dict.get("completed_by_name"), "completed_at": attach_dict.get("completed_at"),
             "replies": [],
         },
         message="Update posted successfully"
+    )
+
+
+
+class TaskCommentUpdate(BaseModel):
+    content: Optional[str] = None
+    is_followup_completed: Optional[bool] = None
+
+
+@router.patch("/{task_id}/comments/{comment_id}")
+async def update_task_comment(
+    task_id: int,
+    comment_id: int,
+    body: TaskCommentUpdate,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    task_r = await db.execute(select(Task).filter(Task.id == task_id, Task.is_deleted == False))
+    task = task_r.scalars().first()
+    if not task:
+        return error_response(message="Task not found")
+
+    comm_r = await db.execute(select(TaskComment).filter(TaskComment.id == comment_id, TaskComment.task_id == task_id, TaskComment.is_deleted == False))
+    comment = comm_r.scalars().first()
+    if not comment:
+        return error_response(message="Comment not found")
+
+    # Anyone who has access can update anything in the follow-up and updates!
+    attach_dict = {}
+    if comment.attachments:
+        try:
+            parsed = json.loads(comment.attachments)
+            if isinstance(parsed, dict):
+                attach_dict = parsed
+            elif isinstance(parsed, list):
+                attach_dict = {"files": parsed}
+        except Exception:
+            attach_dict = {"files": []}
+
+    if body.content is not None and body.content.strip():
+        comment.content = body.content.strip()
+
+    status_changed = False
+    if body.is_followup_completed is not None:
+        old_status = attach_dict.get("is_followup_completed", False)
+        new_status = bool(body.is_followup_completed)
+        if old_status != new_status:
+            status_changed = True
+            attach_dict["is_followup_completed"] = new_status
+            if new_status:
+                attach_dict["completed_by_id"] = current_user.id
+                attach_dict["completed_by_name"] = current_user.full_name or "Teammate"
+                attach_dict["completed_at"] = _iso_utc(datetime.utcnow())
+            else:
+                attach_dict.pop("completed_by_id", None)
+                attach_dict.pop("completed_by_name", None)
+                attach_dict.pop("completed_at", None)
+
+    comment.attachments = json.dumps(attach_dict)
+    comment.updated_at = datetime.utcnow()
+    db.add(comment)
+
+    if status_changed and attach_dict.get("is_followup_completed"):
+        await _add_history(
+            db, task.id, "followup_completed",
+            f"{current_user.full_name or 'Teammate'} marked follow-up #{comment.id} completed",
+            user_id=current_user.id
+        )
+
+        # Notify comment author and task assigner
+        notif_recipients = set()
+        if comment.user_id != current_user.id:
+            notif_recipients.add(comment.user_id)
+        if task.assigned_by_id and task.assigned_by_id != current_user.id:
+            notif_recipients.add(task.assigned_by_id)
+        if task.assigned_to_id and task.assigned_to_id != current_user.id:
+            notif_recipients.add(task.assigned_to_id)
+
+        for r_id in notif_recipients:
+            db.add(Notification(
+                title=f"Follow-up completed on '{task.title}'",
+                message=f"{current_user.full_name or 'A teammate'} marked follow-up #{comment.id} as completed.",
+                type=NotificationTypeEnum.project_update,
+                user_id=r_id,
+                link=f"/workcenter?task={task.id}&tab=updates",
+            ))
+
+    await db.commit()
+    await db.refresh(comment)
+
+    comm_user = await _get_user(db, comment.user_id)
+
+    return success_response(
+        data={
+            "id": comment.id,
+            "task_id": comment.task_id,
+            "user_id": comment.user_id,
+            "user_name": comm_user.full_name if comm_user else "Teammate",
+            "user_avatar": comm_user.profile_picture if comm_user else None,
+            "user_role": comm_user.role if comm_user else None,
+            "content": comment.content,
+            "parent_id": comment.parent_id,
+            "attachments": attach_dict.get("files", []),
+            "is_followup_completed": attach_dict.get("is_followup_completed", False),
+            "completed_by_name": attach_dict.get("completed_by_name"),
+            "completed_at": attach_dict.get("completed_at"),
+            "created_at": _iso_utc(comment.created_at),
+            "replies": [],
+        },
+        message="Follow-up updated successfully"
     )
 
 

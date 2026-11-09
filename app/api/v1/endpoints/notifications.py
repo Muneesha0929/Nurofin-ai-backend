@@ -27,7 +27,15 @@ async def read_notifications(
     )
     notifications = result.scalars().all()
     
-    data = [NotificationSchema.from_orm(n).dict() for n in notifications]
+    data = []
+    for n in notifications:
+        item = NotificationSchema.from_orm(n).dict()
+        if n.created_at:
+            s = n.created_at.isoformat()
+            if not s.endswith("Z") and "+" not in s:
+                s += "Z"
+            item["created_at"] = s
+        data.append(item)
     return success_response(data=data, message="Notifications fetched successfully")
 
 @router.post("", response_model=APIResponse)
