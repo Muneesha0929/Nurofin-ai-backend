@@ -6,7 +6,7 @@ from app.services.mentions import extract_mentioned_users
 from app.services.s3 import upload_file_to_s3, get_presigned_url
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, aliased
-from sqlalchemy import func, or_, case, exists, select, update
+from sqlalchemy import func, or_, and_, case, exists, select, update
 from typing import Any, Optional, List
 from datetime import datetime, timedelta
 
@@ -137,6 +137,9 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "transfer_to_name": transfer_to_name,
         "actual_completion_date": t.actual_completion_date,
         "extended_time": t.extended_time,
+        "scheduled_date": t.scheduled_date,
+        "scheduled_start_time": t.scheduled_start_time,
+        "scheduled_end_time": t.scheduled_end_time,
     }
 
 
@@ -254,7 +257,13 @@ async def read_tasks(
     q = select(Task).options(selectinload(Task.subtasks)).where(Task.is_deleted == False, Task.parent_id == None)
 
     if quarter_id:
-        q = q.where(or_(Task.quarter_id == quarter_id, Task.quarter_id == None))
+        q = q.where(
+            or_(
+                Task.quarter_id == quarter_id,
+                Task.quarter_id == None,
+                Task.subtasks.any(and_(Task.quarter_id == quarter_id, Task.is_deleted == False))
+            )
+        )
     if project_id:
         q = q.where(Task.project_id == project_id)
     if status:
@@ -460,6 +469,7 @@ async def create_task(
     project_id: int = None, quarter_id: int = None, assigned_to_id: int = None,
     reviewer_id: int = None, parent_id: int = None, deadline: str = None,
     start_date: str = None, estimated_hours: float = None,
+    scheduled_date: str = None, scheduled_start_time: str = None, scheduled_end_time: str = None,
 ) -> Any:
     # Handle sentinels from frontend
     actual_project_id = None if (project_id == 0 or project_id is None) else project_id
@@ -474,6 +484,7 @@ async def create_task(
     actual_estimated_hours = None if (estimated_hours is not None and estimated_hours < 0) else estimated_hours
     
     # If subtask, inherit parent dates/quarter if not explicitly set
+    parent = None
     if actual_parent_id:
         parent_r = await db.execute(select(Task).filter(Task.id == actual_parent_id))
         parent = parent_r.scalars().first()
@@ -482,17 +493,23 @@ async def create_task(
                 actual_start_date = parent.start_date
             if not actual_deadline:
                 actual_deadline = parent.deadline
-            if not actual_quarter_id:
-                actual_quarter_id = parent.quarter_id
             if not actual_project_id:
                 actual_project_id = parent.project_id
                 
-    if not actual_quarter_id:
+    if not actual_quarter_id and (actual_deadline or actual_start_date):
         actual_quarter_id = await _determine_quarter_id(db, actual_deadline or actual_start_date)
+    if not actual_quarter_id and parent and parent.quarter_id:
+        actual_quarter_id = parent.quarter_id
+
+    actual_scheduled_date = (None if scheduled_date == "" else scheduled_date) or actual_deadline
+    actual_scheduled_start = (None if scheduled_start_time == "" else scheduled_start_time) or "09:00"
+    actual_scheduled_end = (None if scheduled_end_time == "" else scheduled_end_time) or "10:00"
+
     task = Task(title=title, description=actual_description, priority=priority,
                 project_id=actual_project_id, quarter_id=actual_quarter_id, assigned_to_id=actual_assigned_to_id,
                 assigned_by_id=current_user.id, reviewer_id=actual_reviewer_id, parent_id=actual_parent_id,
-                deadline=actual_deadline, start_date=actual_start_date, estimated_hours=actual_estimated_hours)
+                deadline=actual_deadline, start_date=actual_start_date, estimated_hours=actual_estimated_hours,
+                scheduled_date=actual_scheduled_date, scheduled_start_time=actual_scheduled_start, scheduled_end_time=actual_scheduled_end)
     db.add(task)
     await db.flush()
     await _add_history(db, task.id, "created", "Task created", user_id=current_user.id)
@@ -534,6 +551,7 @@ async def update_task(
     reviewer_id: int = None, progress: float = None,
     project_id: int = None, quarter_id: int = None,
     actual_completion_date: str = None, extended_time: float = None,
+    scheduled_date: str = None, scheduled_start_time: str = None, scheduled_end_time: str = None,
 ) -> Any:
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id, Task.is_deleted == False))
     task = r.scalars().first()
@@ -555,7 +573,15 @@ async def update_task(
     if deadline is not None:
         old_dl = task.deadline
         task.deadline = deadline if deadline != "" else None
+        if scheduled_date is None:
+            task.scheduled_date = task.deadline
         await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+    if scheduled_date is not None:
+        task.scheduled_date = scheduled_date if scheduled_date != "" else None
+    if scheduled_start_time is not None:
+        task.scheduled_start_time = scheduled_start_time if scheduled_start_time != "" else None
+    if scheduled_end_time is not None:
+        task.scheduled_end_time = scheduled_end_time if scheduled_end_time != "" else None
     if actual_completion_date is not None:
         task.actual_completion_date = actual_completion_date if actual_completion_date != "" else None
     if extended_time is not None:
