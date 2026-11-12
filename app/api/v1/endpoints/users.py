@@ -493,8 +493,16 @@ async def check_availability(
     from app.models.task import TaskStatusEnum
     tasks_res = await db.execute(
         select(Task).filter(
-            Task.assigned_to_id == user_id,
-            Task.scheduled_date == date,
+            or_(
+                Task.assigned_to_id == user_id,
+                and_(Task.assigned_to_id.is_(None), Task.assigned_by_id == user_id)
+            ),
+            or_(
+                Task.scheduled_date == date,
+                Task.scheduled_date.like(f"{date}%"),
+                and_(Task.scheduled_date.is_(None), Task.deadline.like(f"{date}%")),
+                and_(Task.scheduled_date.is_(None), Task.start_date.like(f"{date}%"))
+            ),
             Task.is_deleted == False,
             Task.status != TaskStatusEnum.completed,
             Task.scheduled_start_time.isnot(None),

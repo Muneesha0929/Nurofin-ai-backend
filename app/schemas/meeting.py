@@ -27,6 +27,8 @@ class MeetingBase(BaseModel):
     type: Optional[MeetingTypeEnum] = MeetingTypeEnum.meeting
     status: Optional[MeetingStatusEnum] = MeetingStatusEnum.scheduled
     owner_id: Optional[int] = None
+    is_recurring: Optional[bool] = False
+    recurrence_rule: Optional[str] = None
     transcript: Optional[str] = None
     minutes_of_meeting: Optional[str] = None
     metadata_json: Optional[str] = None
