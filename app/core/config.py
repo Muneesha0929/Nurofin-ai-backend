@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     
     DATABASE_URL: str | None = None
 
+    # Build-Track "Report a problem" integration. Empty secret = the intake endpoint answers 503.
+    # Same value as COS_INTEGRATION_SECRET on the Build-Track backend.
+    BUILDTRACK_INTEGRATION_SECRET: str = ""
+    # CoS project that Build-Track issues land in. Empty = first project whose name looks like "Build-Track".
+    BUILDTRACK_ISSUE_PROJECT_ID: str = ""
+
     # Runway (CEO-only cash forecast). Empty = every account with the "ceo" role.
     RUNWAY_ALLOWED_EMAILS: str = ""
     # Local testing only: pretend today is this date (YYYY-MM-DD). Never set in production.

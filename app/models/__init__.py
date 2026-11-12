@@ -9,6 +9,7 @@ from .meeting import (
 )
 from .issue import Issue, IssueStatusEnum, IssuePriorityEnum
 from .issue_followup import IssueFollowup
+from .issue_external import CosIssueExternal
 from .finance_record import FinanceRecord, FinanceRecordTypeEnum, FinanceRecordStatusEnum
 from .performance_review import PerformanceReview
 from .knowledge import Knowledge

@@ -14,6 +14,8 @@ from app.api.v1.endpoints import (
     stream,
     documents,
     issues,
+    issues_external,
+    integrations,
     finance,
 )
 
@@ -33,6 +35,8 @@ api_router.include_router(knowledge.router, prefix="/knowledge", tags=["knowledg
 api_router.include_router(stream.router, prefix="/stream", tags=["stream"])
 api_router.include_router(documents.router, prefix="/documents", tags=["documents"])
 api_router.include_router(issues.router, prefix="/issues", tags=["issues"])
+api_router.include_router(issues_external.router, prefix="/issues", tags=["issues"])
+api_router.include_router(integrations.router, prefix="/integrations", tags=["integrations"])
 api_router.include_router(finance.router, prefix="/finance", tags=["finance"])
 from app.api.v1.endpoints import targets
 api_router.include_router(targets.router, prefix="/targets", tags=["targets"])
