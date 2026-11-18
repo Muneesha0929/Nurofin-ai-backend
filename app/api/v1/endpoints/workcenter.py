@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from app.api import deps
 from app.models.user import User
 from app.models.task import Task, TaskStatusEnum, TaskPriorityEnum
+from app.models.issue import Issue, IssueStatusEnum
 from app.models.quarter import Quarter
 from app.models.project import Project
 from app.models.task_history import TaskHistory
@@ -542,6 +543,40 @@ async def create_task(
     return success_response(data=await _serialize_task(db, task))
 
 
+async def _sync_task_status_to_issue(db: AsyncSession, task: Task, status: str):
+    try:
+        is_issue_task = (task.source and (task.source == "issue" or task.source.startswith("issue:"))) or (task.title and task.title.startswith("[Issue]"))
+        if not is_issue_task:
+            return
+            
+        issue_id = None
+        if task.source and task.source.startswith("issue:"):
+            try:
+                issue_id = int(task.source.split(":")[1])
+            except (ValueError, IndexError):
+                pass
+        
+        clean_title = task.title.replace("[Issue]", "").strip()
+        issue_stmt = select(Issue).filter(Issue.is_deleted == False)
+        if issue_id:
+            issue_stmt = issue_stmt.filter(Issue.id == issue_id)
+        else:
+            issue_stmt = issue_stmt.filter(or_(Issue.title == clean_title, Issue.title.ilike(clean_title)))
+            
+        issue_res = await db.execute(issue_stmt)
+        matched_issue = issue_res.scalars().first()
+        if matched_issue:
+            task.source = f"issue:{matched_issue.id}"
+            is_completed = status in ["completed", "done", "resolved", "closed"]
+            new_issue_status = IssueStatusEnum.resolved if is_completed else IssueStatusEnum.in_progress
+            matched_issue.status = new_issue_status
+            if is_completed and not matched_issue.actual_completion_date:
+                matched_issue.actual_completion_date = datetime.utcnow().strftime('%Y-%m-%d')
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to sync task status to issue: {e}")
+
+
 @router.put("/{task_id}")
 async def update_task(
     *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
@@ -568,6 +603,7 @@ async def update_task(
         old = task.status.value if task.status else None
         task.status = status
         await _add_history(db, task_id, "status_changed", f"Status: {old} → {status}", old_val=old, new_val=status, user_id=current_user.id)
+        await _sync_task_status_to_issue(db, task, status)
     if priority is not None:
         task.priority = priority
     if deadline is not None:
@@ -717,6 +753,7 @@ async def update_status(
     if status == "blocked" and reason:
         desc += f" (Reason: {reason})"
     await _add_history(db, task_id, "status_changed", desc, old_val=old, new_val=status, user_id=current_user.id)
+    await _sync_task_status_to_issue(db, task, status)
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
     await db.commit()

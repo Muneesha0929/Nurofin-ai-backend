@@ -1,4 +1,5 @@
 from typing import Any
+from sqlalchemy import or_
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -305,6 +306,37 @@ async def update_task(
             task.actual_completion_date = datetime.utcnow()
     elif update_data.get("status") and update_data.get("status") not in [TaskStatusEnum.completed, "completed", "done"]:
         task.actual_completion_date = None
+
+    if update_data.get("status"):
+        try:
+            status_val = str(update_data.get("status")).split('.')[-1]
+            is_issue_task = (task.source and (task.source == "issue" or task.source.startswith("issue:"))) or (task.title and task.title.startswith("[Issue]"))
+            if is_issue_task:
+                issue_id = None
+                if task.source and task.source.startswith("issue:"):
+                    try:
+                        issue_id = int(task.source.split(":")[1])
+                    except (ValueError, IndexError):
+                        pass
+                from app.models.issue import Issue, IssueStatusEnum
+                clean_title = task.title.replace("[Issue]", "").strip()
+                issue_stmt = select(Issue).filter(Issue.is_deleted == False)
+                if issue_id:
+                    issue_stmt = issue_stmt.filter(Issue.id == issue_id)
+                else:
+                    issue_stmt = issue_stmt.filter(or_(Issue.title == clean_title, Issue.title.ilike(clean_title)))
+                issue_res = await db.execute(issue_stmt)
+                matched_issue = issue_res.scalars().first()
+                if matched_issue:
+                    task.source = f"issue:{matched_issue.id}"
+                    is_completed = status_val in ["completed", "done", "resolved", "closed"]
+                    new_issue_status = IssueStatusEnum.resolved if is_completed else IssueStatusEnum.in_progress
+                    matched_issue.status = new_issue_status
+                    if is_completed and not matched_issue.actual_completion_date:
+                        matched_issue.actual_completion_date = datetime.utcnow().strftime('%Y-%m-%d')
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to sync task update to issue: {e}")
 
     # Determine quarter_id from updated deadline or scheduled_date
     date_str = update_data.get("deadline") or update_data.get("scheduled_date")

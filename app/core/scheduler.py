@@ -49,18 +49,18 @@ async def process_issue_timeouts():
                             User.is_deleted == False,
                             User.id.notin_(declined_list)
                         )
-                        project_members = (await db.execute(members_stmt)).scalars().all()
+                        proj_members = (await db.execute(members_stmt)).scalars().all()
                         
-                        if project_members:
-                            member_ids = [m.id for m in project_members]
+                        if proj_members:
+                            member_ids = [m.id for m in proj_members]
                             issue_counts = await db.execute(
                                 select(Issue.assigned_user_id, func.count(Issue.id))
                                 .filter(Issue.assigned_user_id.in_(member_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
                                 .group_by(Issue.assigned_user_id)
                             )
                             counts_dict = {row[0]: row[1] for row in issue_counts}
-                            project_members.sort(key=lambda m: counts_dict.get(m.id, 0))
-                            next_assignee = project_members[0]
+                            proj_members.sort(key=lambda m: counts_dict.get(m.id, 0))
+                            next_assignee = proj_members[0]
                             
                     if next_assignee:
                         issue.assigned_user_id = next_assignee.id
@@ -81,7 +81,7 @@ async def process_issue_timeouts():
                     db.add(Notification(
                         title="Issue Assignment Timed Out",
                         message=f"You did not respond to '{issue.title}' within 1 hour. It has been reassigned.",
-                        type=NotificationTypeEnum.system,
+                        type=NotificationTypeEnum.issue_assigned,
                         user_id=old_assignee_id,
                         link=f"/issues?id={issue.id}",
                     ))

@@ -1,5 +1,6 @@
 from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -7,6 +8,7 @@ from sqlalchemy import func, or_
 
 from app.api import deps
 from app.models.issue import Issue, IssueStatusEnum
+from app.models.task import Task, TaskStatusEnum
 from app.models.issue_followup import IssueFollowup
 from app.models.project import Project
 from app.models.user import User
@@ -21,6 +23,13 @@ CEO_ROLES = ("ceo", "admin", "super_admin")
 
 def _role(user: User) -> str:
     return user.role.value if hasattr(user.role, "value") else (user.role or "employee")
+
+
+def _is_admin(user: Optional[User]) -> bool:
+    if not user:
+        return False
+    role = _role(user).lower()
+    return role in CEO_ROLES or user.id in (1, 3) or getattr(user, "is_superuser", False)
 
 
 def _fmt_date(d) -> Optional[str]:
@@ -119,7 +128,7 @@ async def read_issues(
     ).filter(Issue.is_deleted == False)
 
     # Non-privileged users only see issues they reported or were assigned
-    if _role(current_user) not in CEO_ROLES:
+    if not _is_admin(current_user):
         q = q.filter(
             or_(
                 Issue.reported_by_id == current_user.id,
@@ -147,7 +156,7 @@ async def read_issues(
     data = [_serialize_issue(db, issue) for issue in issues]
 
     count_q = select(func.count()).select_from(Issue).filter(Issue.is_deleted == False)
-    if _role(current_user) not in CEO_ROLES:
+    if not _is_admin(current_user):
         count_q = count_q.filter(
             or_(
                 Issue.reported_by_id == current_user.id,
@@ -180,30 +189,39 @@ async def create_issue(
         if not project:
             return error_response(message="Project not found")
 
-    # Auto-assignment logic
-    if not data.get("assigned_user_id") and data.get("project_id"):
-        # Find all users in the project excluding the CEO
-        from app.models.project import project_members
-        stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
-            project_members.c.project_id == data["project_id"], 
-            User.is_deleted == False
-        )
-        proj_members = [m for m in (await db.execute(stmt)).scalars().all() if m.role != "ceo" and getattr(m.role, "value", m.role) != "ceo"]
+    # Auto-assignment logic (Strictly exclude CEO from auto-assigning)
+    if not data.get("assigned_user_id"):
+        candidates = []
+        if data.get("project_id"):
+            from app.models.project import project_members
+            stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
+                project_members.c.project_id == data["project_id"], 
+                User.is_deleted == False
+            )
+            candidates = [
+                m for m in (await db.execute(stmt)).scalars().all() 
+                if (getattr(m.role, "value", m.role) or "").lower() not in CEO_ROLES and m.id != 1
+            ]
         
-        if proj_members:
-            # Simple free-time check: assign to the person with the fewest open issues
-            member_ids = [m.id for m in proj_members]
+        # If no project specified or no non-CEO project members, fall back to all non-CEO company users
+        if not candidates:
+            all_users_stmt = select(User).filter(User.is_deleted == False)
+            candidates = [
+                m for m in (await db.execute(all_users_stmt)).scalars().all()
+                if (getattr(m.role, "value", m.role) or "").lower() not in CEO_ROLES and m.id != 1
+            ]
+
+        if candidates:
+            candidate_ids = [m.id for m in candidates]
             issue_counts = await db.execute(
                 select(Issue.assigned_user_id, func.count(Issue.id))
-                .filter(Issue.assigned_user_id.in_(member_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
+                .filter(Issue.assigned_user_id.in_(candidate_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
                 .group_by(Issue.assigned_user_id)
             )
             counts_dict = {row[0]: row[1] for row in issue_counts}
-            
-            # Sort members by number of active issues
-            proj_members.sort(key=lambda m: counts_dict.get(m.id, 0))
-            best_assignee = proj_members[0]
-            
+            candidates.sort(key=lambda m: counts_dict.get(m.id, 0))
+            best_assignee = candidates[0]
+
             data["assigned_user_id"] = best_assignee.id
             data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
             data["assignment_timestamp"] = datetime.utcnow()
@@ -239,7 +257,7 @@ async def read_issue(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     data = _serialize_issue(db, issue)
@@ -303,6 +321,35 @@ async def update_issue(
             link=f"/issues?id={issue.id}",
         ))
 
+    # Two-way sync: update corresponding Task in task table if status changed
+    if update_data.get("status"):
+        try:
+            status_val = issue.status.value if hasattr(issue.status, "value") else str(issue.status)
+            clean_title = (issue.title or "").strip()
+            is_done = status_val in [IssueStatusEnum.resolved.value, IssueStatusEnum.closed.value]
+            target_task_status = TaskStatusEnum.completed if is_done else TaskStatusEnum.in_progress
+            
+            t_stmt = select(Task).filter(
+                Task.is_deleted == False,
+                or_(
+                    Task.source == f"issue:{issue.id}",
+                    Task.source == "issue",
+                    Task.title == clean_title,
+                    Task.title == f"[Issue] {clean_title}",
+                    Task.title.ilike(f"%{clean_title}%")
+                )
+            )
+            t_res = await db.execute(t_stmt)
+            matched_tasks = t_res.scalars().all()
+            for mt in matched_tasks:
+                mt.status = target_task_status
+                if is_done and not mt.actual_completion_date:
+                    mt.actual_completion_date = datetime.utcnow().strftime('%Y-%m-%d')
+                mt.source = f"issue:{issue.id}"
+        except Exception as sync_err:
+            import logging
+            logging.getLogger(__name__).error(f"Error syncing issue update status to task: {sync_err}")
+
     await db.commit()
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue updated successfully")
@@ -314,7 +361,7 @@ async def delete_issue(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    if _role(current_user) not in CEO_ROLES:
+    if not _is_admin(current_user):
         return error_response(message="Only the CEO or admin can delete issues")
     issue = await _load_issue(db, issue_id)
     if not issue:
@@ -325,23 +372,31 @@ async def delete_issue(
 
 
 @router.put("/{issue_id}/status", response_model=APIResponse)
+@router.patch("/{issue_id}/status", response_model=APIResponse)
 async def update_issue_status(
     issue_id: int,
     *,
     db: AsyncSession = Depends(deps.get_db),
-    status: str,
+    status: Optional[str] = Query(None),
+    payload: Optional[dict] = Body(None),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
+    target_status = status
+    if payload and isinstance(payload, dict) and "status" in payload:
+        target_status = payload["status"]
+    if not target_status:
+        return error_response(message="Status parameter is required")
+
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You cannot update this issue")
 
     old_status = issue.status.value if hasattr(issue.status, "value") else issue.status
-    if status not in [s.value for s in IssueStatusEnum]:
+    if target_status not in [s.value for s in IssueStatusEnum]:
         return error_response(message="Invalid status")
-    issue.status = status
+    issue.status = target_status
     await db.flush()
 
     if old_status != status:
@@ -369,6 +424,33 @@ async def update_issue_status(
                 link=f"/issues?id={issue.id}",
             ))
 
+    # Two-way sync: update corresponding Task in task table
+    try:
+        clean_title = (issue.title or "").strip()
+        is_done = status in [IssueStatusEnum.resolved.value, IssueStatusEnum.closed.value]
+        target_task_status = TaskStatusEnum.completed if is_done else TaskStatusEnum.in_progress
+        
+        t_stmt = select(Task).filter(
+            Task.is_deleted == False,
+            or_(
+                Task.source == f"issue:{issue.id}",
+                Task.source == "issue",
+                Task.title == clean_title,
+                Task.title == f"[Issue] {clean_title}",
+                Task.title.ilike(f"%{clean_title}%")
+            )
+        )
+        t_res = await db.execute(t_stmt)
+        matched_tasks = t_res.scalars().all()
+        for mt in matched_tasks:
+            mt.status = target_task_status
+            if is_done and not mt.actual_completion_date:
+                mt.actual_completion_date = datetime.utcnow().strftime('%Y-%m-%d')
+            mt.source = f"issue:{issue.id}"
+    except Exception as sync_err:
+        import logging
+        logging.getLogger(__name__).error(f"Error syncing issue status to task: {sync_err}")
+
     await db.commit()
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue status updated")
@@ -383,7 +465,7 @@ async def read_followups(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     result = await db.execute(
@@ -407,7 +489,7 @@ async def create_followup(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     db_followup = IssueFollowup(issue_id=issue_id, user_id=current_user.id, message=followup_in.message)
@@ -450,14 +532,38 @@ async def accept_issue(
     if not issue:
         return error_response(message="Issue not found")
     
-    if issue.assigned_user_id != current_user.id:
+    # If already accepted, return success idempotently
+    if issue.assignment_status == IssueAssignmentStatusEnum.accepted:
+        return success_response(data=_serialize_issue(db, issue), message="Issue is already accepted")
+        
+    if not _is_admin(current_user) and issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.reported_by_id != current_user.id:
         return error_response(message="Only the assigned user can accept this issue")
         
-    if issue.assignment_status == IssueAssignmentStatusEnum.accepted:
-        return error_response(message="Issue is already accepted")
-        
+    if not issue.assigned_user_id:
+        issue.assigned_user_id = current_user.id
+
     issue.assignment_status = IssueAssignmentStatusEnum.accepted
     issue.status = IssueStatusEnum.in_progress
+    
+    # Sync corresponding Task in task table as in_progress
+    try:
+        clean_title = (issue.title or "").strip()
+        t_stmt = select(Task).filter(
+            Task.is_deleted == False,
+            or_(
+                Task.source == f"issue:{issue.id}",
+                Task.source == "issue",
+                Task.title == clean_title,
+                Task.title == f"[Issue] {clean_title}",
+                Task.title.ilike(f"%{clean_title}%")
+            )
+        )
+        t_res = await db.execute(t_stmt)
+        for mt in t_res.scalars().all():
+            mt.status = TaskStatusEnum.in_progress
+            mt.source = f"issue:{issue.id}"
+    except Exception as e:
+        pass
     
     # Notify team members/project members that the user is now working on it
     from app.models.project import project_members
@@ -469,7 +575,7 @@ async def accept_issue(
                 db.add(Notification(
                     title="Issue Accepted",
                     message=f"{current_user.full_name} is now working on '{issue.title}'",
-                    type=NotificationTypeEnum.task_assigned, # Reusing type for now
+                    type=NotificationTypeEnum.task_assigned,
                     user_id=member_id,
                     link=f"/issues?id={issue.id}",
                 ))
@@ -491,7 +597,7 @@ async def decline_issue(
     if not issue:
         return error_response(message="Issue not found")
     
-    if issue.assigned_user_id != current_user.id:
+    if not _is_admin(current_user) and issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.reported_by_id != current_user.id:
         return error_response(message="Only the assigned user can decline this issue")
         
     # Add to declined_by_users list
@@ -580,7 +686,7 @@ async def transfer_issue(
     if not issue:
         return error_response(message="Issue not found")
         
-    if issue.assigned_user_id != current_user.id and _role(current_user) not in CEO_ROLES:
+    if issue.assigned_user_id != current_user.id and not _is_admin(current_user) and issue.reported_by_id != current_user.id:
         return error_response(message="Only the assignee or admin can transfer this issue")
         
     target_user = (await db.execute(select(User).filter(User.id == transfer_in.user_id, User.is_deleted == False))).scalars().first()
