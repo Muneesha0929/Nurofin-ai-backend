@@ -29,3 +29,6 @@ Thumbs.db
 *.db
 nurofin_db.db
 
+
+# local screenshot / upload fallback (never commit)
+uploads/

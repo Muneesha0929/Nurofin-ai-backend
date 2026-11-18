@@ -15,6 +15,9 @@ from app.models.user import User
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.issue import IssueCreate, IssueUpdate, IssueFollowupCreate
 from app.core.responses import APIResponse, success_response, error_response
+from app.services.issue_assignment import auto_assign_fields
+from app.services.issue_external import build_track_member_clause, can_view_issue, external_brief
+from app.services.issue_callbacks import schedule_status_callback
 
 router = APIRouter()
 
@@ -75,6 +78,8 @@ def _serialize_issue(db: AsyncSession, issue: Issue) -> dict:
         "reported_by_id": issue.reported_by_id,
         "reported_by": _user_brief(issue.reported_by),
         "followup_count": followup_count,
+        # Set when the issue was raised from Build-Track; None for every ordinary issue.
+        "external": external_brief(issue.__dict__.get("external")),
         "created_at": _fmt_date(issue.created_at),
         "updated_at": _fmt_date(issue.updated_at),
     }
@@ -100,6 +105,7 @@ async def _load_issue(db: AsyncSession, issue_id: int) -> Optional[Issue]:
             selectinload(Issue.assigned_user),
             selectinload(Issue.reported_by),
             selectinload(Issue.followups).selectinload(IssueFollowup.user),
+            selectinload(Issue.external),
         )
         .filter(Issue.id == issue_id, Issue.is_deleted == False)
     )
@@ -125,6 +131,7 @@ async def read_issues(
         selectinload(Issue.assigned_user),
         selectinload(Issue.reported_by),
         selectinload(Issue.followups).selectinload(IssueFollowup.user),
+        selectinload(Issue.external),
     ).filter(Issue.is_deleted == False)
 
     # Non-privileged users only see issues they reported or were assigned
@@ -133,6 +140,7 @@ async def read_issues(
             or_(
                 Issue.reported_by_id == current_user.id,
                 Issue.assigned_user_id == current_user.id,
+                build_track_member_clause(current_user.id),
             )
         )
 
@@ -161,6 +169,7 @@ async def read_issues(
             or_(
                 Issue.reported_by_id == current_user.id,
                 Issue.assigned_user_id == current_user.id,
+                build_track_member_clause(current_user.id),
             )
         )
     total = (await db.execute(count_q)).scalar() or 0
@@ -191,40 +200,7 @@ async def create_issue(
 
     # Auto-assignment logic (Strictly exclude CEO from auto-assigning)
     if not data.get("assigned_user_id"):
-        candidates = []
-        if data.get("project_id"):
-            from app.models.project import project_members
-            stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
-                project_members.c.project_id == data["project_id"], 
-                User.is_deleted == False
-            )
-            candidates = [
-                m for m in (await db.execute(stmt)).scalars().all() 
-                if (getattr(m.role, "value", m.role) or "").lower() not in CEO_ROLES and m.id != 1
-            ]
-        
-        # If no project specified or no non-CEO project members, fall back to all non-CEO company users
-        if not candidates:
-            all_users_stmt = select(User).filter(User.is_deleted == False)
-            candidates = [
-                m for m in (await db.execute(all_users_stmt)).scalars().all()
-                if (getattr(m.role, "value", m.role) or "").lower() not in CEO_ROLES and m.id != 1
-            ]
-
-        if candidates:
-            candidate_ids = [m.id for m in candidates]
-            issue_counts = await db.execute(
-                select(Issue.assigned_user_id, func.count(Issue.id))
-                .filter(Issue.assigned_user_id.in_(candidate_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
-                .group_by(Issue.assigned_user_id)
-            )
-            counts_dict = {row[0]: row[1] for row in issue_counts}
-            candidates.sort(key=lambda m: counts_dict.get(m.id, 0))
-            best_assignee = candidates[0]
-
-            data["assigned_user_id"] = best_assignee.id
-            data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
-            data["assignment_timestamp"] = datetime.utcnow()
+        data.update(await auto_assign_fields(db, data.get("project_id")))
     # If assigned to anyone (either explicitly or via auto-assign), set to pending acceptance
     if data.get("assigned_user_id") and not data.get("assignment_status"):
         data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
@@ -257,7 +233,7 @@ async def read_issue(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not await can_view_issue(db, current_user, issue):
         return error_response(message="You do not have access to this issue")
 
     data = _serialize_issue(db, issue)
@@ -351,6 +327,7 @@ async def update_issue(
             logging.getLogger(__name__).error(f"Error syncing issue update status to task: {sync_err}")
 
     await db.commit()
+    schedule_status_callback(issue_id, old_status, new_status)   # Build-Track-sourced issues only; no-op otherwise
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue updated successfully")
 
@@ -452,6 +429,7 @@ async def update_issue_status(
         logging.getLogger(__name__).error(f"Error syncing issue status to task: {sync_err}")
 
     await db.commit()
+    schedule_status_callback(issue_id, old_status, status)
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue status updated")
 
@@ -465,7 +443,7 @@ async def read_followups(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not await can_view_issue(db, current_user, issue):
         return error_response(message="You do not have access to this issue")
 
     result = await db.execute(
@@ -489,7 +467,7 @@ async def create_followup(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not _is_admin(current_user) and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
+    if not await can_view_issue(db, current_user, issue):
         return error_response(message="You do not have access to this issue")
 
     db_followup = IssueFollowup(issue_id=issue_id, user_id=current_user.id, message=followup_in.message)
@@ -539,9 +517,9 @@ async def accept_issue(
     if not _is_admin(current_user) and issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.reported_by_id != current_user.id:
         return error_response(message="Only the assigned user can accept this issue")
         
+    old_status = issue.status
     if not issue.assigned_user_id:
         issue.assigned_user_id = current_user.id
-
     issue.assignment_status = IssueAssignmentStatusEnum.accepted
     issue.status = IssueStatusEnum.in_progress
     
@@ -581,6 +559,7 @@ async def accept_issue(
                 ))
     
     await db.commit()
+    schedule_status_callback(issue_id, old_status, IssueStatusEnum.in_progress)
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue accepted successfully")
 
@@ -605,6 +584,7 @@ async def decline_issue(
     if current_user.id not in declined_list:
         declined_list.append(current_user.id)
     issue.declined_by_users = declined_list
+    old_status = issue.status
     
     # Auto-assign to next person logic
     next_assignee = None
@@ -663,6 +643,7 @@ async def decline_issue(
         # Could notify admin here
         
     await db.commit()
+    schedule_status_callback(issue_id, old_status, issue.status)
     loaded = await _load_issue(db, issue_id)
     return success_response(data=_serialize_issue(db, loaded), message="Issue declined. It has been routed to the next available teammate.")
 
