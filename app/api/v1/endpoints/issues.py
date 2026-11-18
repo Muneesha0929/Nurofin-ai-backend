@@ -363,6 +363,7 @@ async def update_issue_status(
         target_status = payload["status"]
     if not target_status:
         return error_response(message="Status parameter is required")
+    status = target_status
 
     issue = await _load_issue(db, issue_id)
     if not issue:

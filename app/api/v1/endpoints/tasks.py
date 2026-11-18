@@ -267,6 +267,23 @@ async def create_task(
         from fastapi.responses import JSONResponse
         return JSONResponse(status_code=400, content={"message": str(e), "traceback": error_details})
 
+@router.get("/{id}", response_model=APIResponse)
+async def get_task(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    id: int,
+    current_user: User = Depends(deps.get_current_user)
+) -> Any:
+    result = await db.execute(
+        select(Task)
+        .options(selectinload(Task.assigned_to), selectinload(Task.assigned_by), selectinload(Task.project))
+        .filter(Task.id == id, Task.is_deleted == False)
+    )
+    task = result.scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return success_response(data=TaskSchema.from_orm(task).dict(), message="Task fetched successfully")
+
 @router.put("/{id}", response_model=APIResponse)
 async def update_task(
     *,
