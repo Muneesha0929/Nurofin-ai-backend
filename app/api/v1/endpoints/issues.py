@@ -198,9 +198,33 @@ async def create_issue(
         if not project:
             return error_response(message="Project not found")
 
-    # Auto-assignment logic (Strictly exclude CEO from auto-assigning)
-    if not data.get("assigned_user_id"):
-        data.update(await auto_assign_fields(db, data.get("project_id")))
+    # Auto-assignment logic
+    if not data.get("assigned_user_id") and data.get("project_id"):
+        # Find all users in the project excluding the CEO
+        from app.models.project import project_members
+        stmt = select(User).join(project_members, project_members.c.user_id == User.id).filter(
+            project_members.c.project_id == data["project_id"], 
+            User.is_deleted == False
+        )
+        proj_members = [m for m in (await db.execute(stmt)).scalars().all() if m.role != "ceo" and getattr(m.role, "value", m.role) != "ceo"]
+        
+        if proj_members:
+            # Simple free-time check: assign to the person with the fewest open issues
+            member_ids = [m.id for m in proj_members]
+            issue_counts = await db.execute(
+                select(Issue.assigned_user_id, func.count(Issue.id))
+                .filter(Issue.assigned_user_id.in_(member_ids), Issue.status.in_([IssueStatusEnum.open, IssueStatusEnum.in_progress]))
+                .group_by(Issue.assigned_user_id)
+            )
+            counts_dict = {row[0]: row[1] for row in issue_counts}
+            
+            # Sort members by number of active issues
+            proj_members.sort(key=lambda m: counts_dict.get(m.id, 0))
+            best_assignee = proj_members[0]
+            
+            data["assigned_user_id"] = best_assignee.id
+            data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
+            data["assignment_timestamp"] = datetime.utcnow()
     # If assigned to anyone (either explicitly or via auto-assign), set to pending acceptance
     if data.get("assigned_user_id") and not data.get("assignment_status"):
         data["assignment_status"] = IssueAssignmentStatusEnum.pending_acceptance
@@ -233,7 +257,7 @@ async def read_issue(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not await can_view_issue(db, current_user, issue):
+    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     data = _serialize_issue(db, issue)
@@ -363,7 +387,6 @@ async def update_issue_status(
         target_status = payload["status"]
     if not target_status:
         return error_response(message="Status parameter is required")
-    status = target_status
 
     issue = await _load_issue(db, issue_id)
     if not issue:
@@ -444,7 +467,7 @@ async def read_followups(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not await can_view_issue(db, current_user, issue):
+    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     result = await db.execute(
@@ -468,7 +491,7 @@ async def create_followup(
     issue = await _load_issue(db, issue_id)
     if not issue:
         return error_response(message="Issue not found")
-    if not await can_view_issue(db, current_user, issue):
+    if _role(current_user) not in CEO_ROLES and issue.reported_by_id != current_user.id and issue.assigned_user_id != current_user.id:
         return error_response(message="You do not have access to this issue")
 
     db_followup = IssueFollowup(issue_id=issue_id, user_id=current_user.id, message=followup_in.message)
@@ -518,9 +541,9 @@ async def accept_issue(
     if not _is_admin(current_user) and issue.assigned_user_id and issue.assigned_user_id != current_user.id and issue.reported_by_id != current_user.id:
         return error_response(message="Only the assigned user can accept this issue")
         
-    old_status = issue.status
-    if not issue.assigned_user_id:
-        issue.assigned_user_id = current_user.id
+    if issue.assignment_status == IssueAssignmentStatusEnum.accepted:
+        return error_response(message="Issue is already accepted")
+        
     issue.assignment_status = IssueAssignmentStatusEnum.accepted
     issue.status = IssueStatusEnum.in_progress
     
