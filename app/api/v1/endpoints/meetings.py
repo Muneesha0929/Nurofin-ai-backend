@@ -5,6 +5,7 @@ import os
 import time as _time
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
@@ -111,6 +112,7 @@ def _serialize_meeting(m: Meeting) -> dict:
         "type": m.type.value if m.type else "meeting",
         "status": m.status.value if m.status else "scheduled",
         "is_recurring": m.is_recurring,
+        "recurrence_rule": m.recurrence_rule,
         "owner_id": m.owner_id,
         "owner_name": owner_name,
         "owner_avatar": owner_avatar,
@@ -171,7 +173,7 @@ def _serialize_extracted_task(t: MeetingExtractedTask) -> dict:
 async def read_meetings(
     db: AsyncSession = Depends(deps.get_db),
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 500,
     filter: Optional[str] = Query(None, description="Filter by: today, weekly, monthly"),
     search: Optional[str] = Query(None, description="Search by title"),
     sort: Optional[str] = Query(None, description="Sort by: date, title, status"),
@@ -581,6 +583,7 @@ async def delete_meeting(
     *,
     db: AsyncSession = Depends(deps.get_db),
     id: int,
+    delete_series: Optional[bool] = Query(None, description="Whether to delete entire recurring series"),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     result = await db.execute(
@@ -592,19 +595,77 @@ async def delete_meeting(
     if not meeting:
         return error_response(message="Event not found")
 
-    for pe in (meeting.participant_entries or []):
-        if pe.user_id != current_user.id:
-            await _create_notification(
-                db, pe.user_id,
-                title=f"Meeting cancelled: {meeting.title}",
-                message=f"The meeting '{meeting.title}' has been cancelled.",
-                notif_type=NotificationTypeEnum.meeting_cancellation,
-                link=f"/meetings?id={id}",
-            )
+    should_delete_series = delete_series is True or (delete_series is None and (meeting.is_recurring or bool(meeting.recurrence_rule)))
 
-    meeting.is_deleted = True
+    if should_delete_series:
+        filters = [
+            Meeting.is_deleted == False,
+            Meeting.title == meeting.title,
+            Meeting.start_time == meeting.start_time,
+            Meeting.end_time == meeting.end_time,
+            or_(
+                Meeting.owner_id == meeting.owner_id,
+                Meeting.created_by_id == meeting.created_by_id,
+                Meeting.owner_id == current_user.id,
+            ),
+        ]
+        if meeting.recurrence_rule:
+            filters.append(Meeting.recurrence_rule == meeting.recurrence_rule)
+        elif meeting.is_recurring:
+            filters.append(Meeting.is_recurring == True)
+
+        series_meetings = []
+        if meeting.created_at:
+            window_start = meeting.created_at - timedelta(minutes=15)
+            window_end = meeting.created_at + timedelta(minutes=15)
+            batch_q = select(Meeting).options(selectinload(Meeting.participant_entries)).filter(
+                *filters,
+                Meeting.created_at >= window_start,
+                Meeting.created_at <= window_end
+            )
+            batch_res = await db.execute(batch_q)
+            batch_meetings = batch_res.scalars().all()
+            if len(batch_meetings) > 1:
+                series_meetings = batch_meetings
+
+        if not series_meetings:
+            all_q = select(Meeting).options(selectinload(Meeting.participant_entries)).filter(*filters)
+            all_res = await db.execute(all_q)
+            series_meetings = all_res.scalars().all()
+
+        for sm in series_meetings:
+            sm.is_deleted = True
+            for pe in (sm.participant_entries or []):
+                if pe.user_id != current_user.id:
+                    await _create_notification(
+                        db, pe.user_id,
+                        title=f"Meeting cancelled: {sm.title}",
+                        message=f"The meeting '{sm.title}' has been cancelled.",
+                        notif_type=NotificationTypeEnum.meeting_cancellation,
+                        link=f"/meetings?id={sm.id}",
+                    )
+    else:
+        for pe in (meeting.participant_entries or []):
+            if pe.user_id != current_user.id:
+                await _create_notification(
+                    db, pe.user_id,
+                    title=f"Meeting cancelled: {meeting.title}",
+                    message=f"The meeting '{meeting.title}' has been cancelled.",
+                    notif_type=NotificationTypeEnum.meeting_cancellation,
+                    link=f"/meetings?id={id}",
+                )
+        meeting.is_deleted = True
+
     await db.commit()
-    return success_response(message="Event deleted")
+
+    try:
+        from app.api.v1.endpoints import my_meetings
+        if hasattr(my_meetings, "_cache"):
+            my_meetings._cache.clear()
+    except Exception:
+        pass
+
+    return success_response(message="Event deleted successfully")
 
 
 @router.post("/{id}/accept", response_model=APIResponse)
