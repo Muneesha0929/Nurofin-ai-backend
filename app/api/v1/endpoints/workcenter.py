@@ -84,6 +84,13 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
     assigner = await get_user_cached(t.assigned_by_id)
     reviewer = await get_user_cached(t.reviewer_id)
     project = await get_project_cached(t.project_id)
+    parent_title = None
+    if t.parent_id:
+        parent_t = (await db.execute(select(Task).filter(Task.id == t.parent_id))).scalars().first()
+        if parent_t:
+            parent_title = parent_t.title
+            if not project and parent_t.project_id:
+                project = await get_project_cached(parent_t.project_id)
     
     # Fetch latest transfer history
     transfer_date = None
@@ -129,9 +136,11 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "assigned_by_name": assigner.full_name if assigner else None,
         "reviewer_id": t.reviewer_id,
         "reviewer_name": reviewer.full_name if reviewer else None,
-        "project_id": t.project_id,
+        "project_id": t.project_id or (project.id if project else None),
         "project_name": project.name if project else None,
-        "parent_id": t.parent_id, "quarter_id": t.quarter_id,
+        "parent_id": t.parent_id,
+        "parent_title": parent_title,
+        "quarter_id": t.quarter_id,
         "meeting_id": t.meeting_id, "subtasks": subtasks,
         "created_at": _iso_utc(t.created_at),
         "transfer_date": transfer_date,
