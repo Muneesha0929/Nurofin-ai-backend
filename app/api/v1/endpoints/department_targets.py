@@ -54,7 +54,7 @@ from app.schemas.department_target import (
 
 router = APIRouter()
 
-DIRECTOR_ROLES = ("ceo", "super_admin", "admin", "director", "chief_of_staff", "team_lead")
+DIRECTOR_ROLES = ("ceo", "super_admin", "admin", "director", "chief_of_staff", "team_lead", "manager", "employee", "member")
 OUTCOMES = {"achieved": "Achieved", "met_partly": "Met partly", "not_met": "Not met"}
 QUARTER_MONTHS = {1: ("Apr", "Jun"), 2: ("Jul", "Sep"), 3: ("Oct", "Dec"), 4: ("Jan", "Mar")}
 
