@@ -151,7 +151,12 @@ def require_see(user: User, dept: TargetDepartment) -> None:
 
 
 def can_plan(user: User, dept: TargetDepartment) -> bool:
-    return is_director(user) or (dept.hod_id is not None and dept.hod_id == user.id)
+    """CEO/Director, HOD, and department members can plan/add objectives and targets."""
+    if is_director(user):
+        return True
+    if dept.hod_id is not None and dept.hod_id == user.id:
+        return True
+    return any(m.id == user.id for m in dept.members)
 
 
 def leaf_progress(o: DepartmentObjective) -> float:
@@ -393,7 +398,7 @@ async def overview(
             new_targets.append({"department_id": d.id, "department_name": d.name, "objectives": stats["objectives"]})
         # totals and progress above stay company-wide; the department cards are only for people in them
         if can_see(current_user, d):
-            departments.append({**dept_payload(d), **target_payload(t), **stats, "new_for_me": unread})
+            departments.append({**dept_payload(d), **target_payload(t), **stats, "objectives_tree": tree, "new_for_me": unread})
 
     widgets = (await db.execute(
         select(CompanyWidget).filter(CompanyWidget.fiscal_year == fy, CompanyWidget.quarter_number == q, CompanyWidget.is_deleted == False)
@@ -605,10 +610,19 @@ async def update_quarter_target(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """Director writes the message and / or marks the quarter result."""
-    require_director(current_user)
+    """Director, HOD, or department member writes the message; Director marks the quarter result."""
     check_quarter(fiscal_year, quarter)
     dept = await get_department(db, dept_id)
+    fields = target_in.model_fields_set
+
+    # Writing message: Director, HOD, or member of the department can write/update the target
+    if "message" in fields and not can_plan(current_user, dept):
+        raise HTTPException(status_code=403, detail="You do not have permission to set targets for this department.")
+
+    # Marking outcome/result: only Director can mark the official quarter outcome
+    if ("outcome" in fields or "outcome_note" in fields) and not is_director(current_user):
+        raise HTTPException(status_code=403, detail="Only the Director can mark the quarter outcome.")
+
     t = (await db.execute(
         select(DepartmentQuarterTarget).filter(
             DepartmentQuarterTarget.department_id == dept_id,
@@ -620,7 +634,6 @@ async def update_quarter_target(
         t = DepartmentQuarterTarget(department_id=dept_id, fiscal_year=fiscal_year, quarter_number=quarter)
         db.add(t)
     t.is_deleted = False
-    fields = target_in.model_fields_set
     now = datetime.utcnow()
     message_changed = False
 
