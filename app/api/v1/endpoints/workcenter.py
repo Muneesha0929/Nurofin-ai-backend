@@ -262,7 +262,7 @@ async def read_tasks(
     quarter_id: Optional[int] = None, project_id: Optional[int] = None,
     status: Optional[str] = None, priority: Optional[str] = None,
     assignee_id: Optional[int] = None, search: Optional[str] = None,
-    page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
+    page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=1000),
 ) -> Any:
     q = select(Task).options(selectinload(Task.subtasks)).where(Task.is_deleted == False, Task.parent_id == None)
 
@@ -484,7 +484,7 @@ async def create_task(
     # Handle sentinels from frontend
     actual_project_id = None if (project_id == 0 or project_id is None) else project_id
     actual_quarter_id = None if (quarter_id == 0 or quarter_id is None) else quarter_id
-    actual_assigned_to_id = None if (assigned_to_id == 0 or assigned_to_id is None) else assigned_to_id
+    actual_assigned_to_id = current_user.id if (assigned_to_id == 0 or assigned_to_id is None) else assigned_to_id
     actual_reviewer_id = None if (reviewer_id == 0 or reviewer_id is None) else reviewer_id
     actual_parent_id = None if (parent_id == 0 or parent_id is None) else parent_id
     

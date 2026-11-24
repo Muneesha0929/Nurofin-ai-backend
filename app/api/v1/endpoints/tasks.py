@@ -82,9 +82,7 @@ async def read_tasks(
         .filter(Issue.is_deleted == False)
         .filter(Issue.assignment_status == IssueAssignmentStatusEnum.accepted)
     )
-    # If not a CEO/admin, only show their issues
-    if not (current_user.role and hasattr(current_user.role, "value") and current_user.role.value in ("ceo", "admin", "super_admin")) and current_user.role not in ("ceo", "admin", "super_admin"):
-        issues_stmt = issues_stmt.filter(Issue.assigned_user_id == current_user.id)
+    # All accepted issues are visible in Task Center for company collaboration
         
     issues_result = await db.execute(issues_stmt.offset(skip).limit(limit))
     issues = issues_result.scalars().all()
@@ -109,8 +107,20 @@ async def read_tasks(
             "assigned_to_id": issue.assigned_user_id,
             "assigned_by_id": issue.reported_by_id,
             "project_id": issue.project_id,
-            "assigned_to": {"id": issue.assigned_user.id, "full_name": issue.assigned_user.full_name, "profile_picture": issue.assigned_user.profile_picture} if issue.assigned_user else None,
-            "assigned_by": {"id": issue.reported_by.id, "full_name": issue.reported_by.full_name, "profile_picture": issue.reported_by.profile_picture} if issue.reported_by else None,
+            "assigned_to": {
+                "id": issue.assigned_user.id,
+                "name": issue.assigned_user.full_name,
+                "avatar": issue.assigned_user.profile_picture,
+                "full_name": issue.assigned_user.full_name,
+                "profile_picture": issue.assigned_user.profile_picture
+            } if issue.assigned_user else None,
+            "assigned_by": {
+                "id": issue.reported_by.id,
+                "name": issue.reported_by.full_name,
+                "avatar": issue.reported_by.profile_picture,
+                "full_name": issue.reported_by.full_name,
+                "profile_picture": issue.reported_by.profile_picture
+            } if issue.reported_by else None,
             "is_issue": True,
             "has_subtasks": False,
             "scheduled_date": issue.scheduled_date,
@@ -225,6 +235,8 @@ async def create_task(
                 if not quarter_id and parent_task.quarter_id:
                     quarter_id = parent_task.quarter_id
                 
+        if not task_data.get("assigned_to_id"):
+            task_data["assigned_to_id"] = current_user.id
         db_task = Task(**task_data, assigned_by_id=current_user.id, quarter_id=quarter_id)
         db.add(db_task)
         await db.flush()

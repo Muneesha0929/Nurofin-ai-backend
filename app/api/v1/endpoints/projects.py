@@ -92,12 +92,8 @@ async def read_projects(
             selectinload(Project.tasks).selectinload(Task.assigned_to)
         )
         .filter(Project.is_deleted == False)
+        .order_by(Project.id.asc())
     )
-    if current_user.role not in ["super_admin", "ceo"]:
-        stmt = stmt.filter(
-            (Project.owner_id == current_user.id) | 
-            (Project.members.any(User.id == current_user.id))
-        )
         
     result = await db.execute(stmt.offset(skip).limit(limit))
     projects = result.scalars().all()

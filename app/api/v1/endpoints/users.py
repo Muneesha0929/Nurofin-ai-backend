@@ -135,6 +135,10 @@ async def update_user(
         update_data.pop("department", None)
         update_data.pop("is_active", None)
         
+    # Safeguard: Only User ID 1 (Vincent) can have role CEO
+    if update_data.get("role") in ("ceo", "CEO") and user_id != 1:
+        update_data["role"] = "employee" 
+        
     if "password" in update_data and update_data["password"]:
         hashed_password = get_password_hash(update_data["password"])
         db_user.hashed_password = hashed_password
