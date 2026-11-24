@@ -151,12 +151,10 @@ def require_see(user: User, dept: TargetDepartment) -> None:
 
 
 def can_plan(user: User, dept: TargetDepartment) -> bool:
-    """CEO/Director, HOD, and department members can plan/add objectives and targets."""
+    """Only the Director/CEO and the department HOD can set targets and objectives."""
     if is_director(user):
         return True
-    if dept.hod_id is not None and dept.hod_id == user.id:
-        return True
-    return any(m.id == user.id for m in dept.members)
+    return dept.hod_id is not None and dept.hod_id == user.id
 
 
 def leaf_progress(o: DepartmentObjective) -> float:
@@ -388,7 +386,8 @@ async def overview(
     progress_values = []
     for d in depts:
         t = targets.get(d.id)
-        stats = summarize(build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks))
+        tree = build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks)
+        stats = summarize(tree)
         for k in totals:
             totals[k] += stats[k]
         if stats["progress"] is not None:
