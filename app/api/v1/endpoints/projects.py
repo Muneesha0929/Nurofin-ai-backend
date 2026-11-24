@@ -94,6 +94,13 @@ async def read_projects(
         .filter(Project.is_deleted == False)
         .order_by(Project.id.asc())
     )
+    role = getattr(current_user, "role", "") or ""
+    role_str = str(role.value if hasattr(role, "value") else role).lower()
+    if role_str not in ("super_admin", "ceo", "admin", "director", "chief_of_staff") and current_user.id != 1:
+        stmt = stmt.filter(
+            (Project.owner_id == current_user.id) | 
+            (Project.members.any(User.id == current_user.id))
+        )
         
     result = await db.execute(stmt.offset(skip).limit(limit))
     projects = result.scalars().all()

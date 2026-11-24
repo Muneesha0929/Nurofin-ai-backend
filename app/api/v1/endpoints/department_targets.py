@@ -54,7 +54,7 @@ from app.schemas.department_target import (
 
 router = APIRouter()
 
-DIRECTOR_ROLES = ("ceo", "super_admin", "admin", "director", "chief_of_staff", "team_lead", "manager", "employee", "member")
+DIRECTOR_ROLES = ("ceo", "super_admin", "admin", "director", "chief_of_staff")
 OUTCOMES = {"achieved": "Achieved", "met_partly": "Met partly", "not_met": "Not met"}
 QUARTER_MONTHS = {1: ("Apr", "Jun"), 2: ("Jul", "Sep"), 3: ("Oct", "Dec"), 4: ("Jan", "Mar")}
 
@@ -67,7 +67,7 @@ def _role(user: User) -> str:
 
 
 def is_director(user: User) -> bool:
-    return _role(user) in DIRECTOR_ROLES
+    return _role(user) in DIRECTOR_ROLES or user.id == 1
 
 
 def require_director(user: User) -> None:
@@ -137,8 +137,12 @@ async def load_users(db: AsyncSession, ids: List[int]) -> List[User]:
 
 
 def can_see(user: User, dept: TargetDepartment) -> bool:
-    """In the Executive portal, all company team members can view company departments and targets."""
-    return True
+    """Show the department only to members who are in that department, or HOD, or Director/CEO."""
+    if is_director(user):
+        return True
+    if dept.hod_id is not None and dept.hod_id == user.id:
+        return True
+    return any(m.id == user.id for m in dept.members)
 
 
 def require_see(user: User, dept: TargetDepartment) -> None:
