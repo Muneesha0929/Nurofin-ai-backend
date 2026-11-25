@@ -123,6 +123,32 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         except Exception:
             pass
 
+    # Completion date change history (newest first)
+    date_history = []
+    prebuilt_dh = cache.get("date_history_lookup")
+    if prebuilt_dh is not None:
+        date_history = prebuilt_dh.get(t.id, [])
+    else:
+        dh_rows = (await db.execute(
+            select(TaskHistory)
+            .filter(
+                TaskHistory.task_id == t.id,
+                TaskHistory.action == "actual_completion_date_changed",
+                TaskHistory.is_deleted == False,
+            )
+            .order_by(TaskHistory.created_at.desc(), TaskHistory.id.desc())
+        )).scalars().all()
+        for h in dh_rows:
+            u = await get_user_cached(h.performed_by_id)
+            date_history.append({
+                "id": h.id,
+                "old_value": h.old_value,
+                "new_value": h.new_value,
+                "description": h.description,
+                "changed_by": u.full_name if u else None,
+                "changed_at": _iso_utc(h.created_at),
+            })
+
     return {
         "id": t.id, "title": t.title, "description": t.description,
         "status": t.status.value if hasattr(t.status, 'value') else (t.status or "todo"),
@@ -146,6 +172,7 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "transfer_date": transfer_date,
         "transfer_to_name": transfer_to_name,
         "actual_completion_date": t.actual_completion_date,
+        "completion_date_history": date_history,
         "extended_time": t.extended_time,
         "scheduled_date": t.scheduled_date,
         "scheduled_start_time": t.scheduled_start_time,
@@ -360,6 +387,50 @@ async def read_tasks(
             cache['comment_counts'] = {tid: cnt for tid, cnt in cc_rows}
         except Exception:
             cache['comment_counts'] = {}
+
+    # Batch-load completion date change history across parent tasks & loaded subtasks
+    all_ids = list(top_ids)
+    def _collect_sub_ids(nodes, depth=0):
+        if depth >= 5:
+            return
+        for node in nodes or []:
+            try:
+                for st in node.subtasks or []:
+                    if not st.is_deleted:
+                        all_ids.append(st.id)
+                        _collect_sub_ids([st], depth + 1)
+            except Exception:
+                pass
+    _collect_sub_ids(tasks)
+    if all_ids:
+        try:
+            dh_rows = (await db.execute(
+                select(TaskHistory)
+                .where(
+                    TaskHistory.task_id.in_(all_ids),
+                    TaskHistory.action == "actual_completion_date_changed",
+                    TaskHistory.is_deleted == False,
+                )
+                .order_by(TaskHistory.created_at.desc(), TaskHistory.id.desc())
+            )).scalars().all()
+            uid_set = {h.performed_by_id for h in dh_rows if h.performed_by_id and h.performed_by_id not in cache['users']}
+            if uid_set:
+                for u in (await db.execute(select(User).filter(User.id.in_(uid_set)))).scalars().all():
+                    cache['users'][u.id] = u
+            dh_map: dict = {}
+            for h in dh_rows:
+                u = cache['users'].get(h.performed_by_id)
+                dh_map.setdefault(h.task_id, []).append({
+                    "id": h.id,
+                    "old_value": h.old_value,
+                    "new_value": h.new_value,
+                    "description": h.description,
+                    "changed_by": u.full_name if u else None,
+                    "changed_at": _iso_utc(h.created_at),
+                })
+            cache['date_history_lookup'] = dh_map
+        except Exception:
+            cache['date_history_lookup'] = {}
 
     data = []
     for t in tasks:
@@ -702,12 +773,14 @@ async def update_task(
         await _sync_task_status_to_issue(db, task, status)
     if priority is not None:
         task.priority = priority
-    if deadline is not None:
-        old_dl = task.deadline
-        task.deadline = deadline if deadline != "" else None
-        if scheduled_date is None:
-            task.scheduled_date = task.deadline
-        await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+    # Target Date (deadline) is fixed from the beginning once set
+    if deadline is not None and not task.deadline:
+        new_dl = deadline if deadline != "" else None
+        if new_dl:
+            task.deadline = new_dl
+            if scheduled_date is None:
+                task.scheduled_date = task.deadline
+            await _add_history(db, task_id, "deadline_updated", f"Target Date set: {new_dl}", old_val=None, new_val=new_dl, user_id=current_user.id)
     if scheduled_date is not None:
         task.scheduled_date = scheduled_date if scheduled_date != "" else None
     if scheduled_start_time is not None:
@@ -715,7 +788,19 @@ async def update_task(
     if scheduled_end_time is not None:
         task.scheduled_end_time = scheduled_end_time if scheduled_end_time != "" else None
     if actual_completion_date is not None:
-        task.actual_completion_date = actual_completion_date if actual_completion_date != "" else None
+        old_acd = task.actual_completion_date
+        new_acd = actual_completion_date if actual_completion_date != "" else None
+        if new_acd != old_acd:
+            task.actual_completion_date = new_acd
+            await _add_history(
+                db,
+                task_id,
+                "actual_completion_date_changed",
+                f"Actual Completion Date: {old_acd or 'Not set'} → {new_acd or 'Cleared'}",
+                old_val=old_acd,
+                new_val=new_acd,
+                user_id=current_user.id,
+            )
     if extended_time is not None:
         task.extended_time = extended_time
         # Propagate deadline to subtasks

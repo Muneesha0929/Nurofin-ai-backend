@@ -1683,16 +1683,24 @@ async def task_links(
         d = depts.get(o.department_id)
         if d and can_see(current_user, d):
             proj_id, proj_name = obj_project_map.get(o.id, (o.project_id, None))
+            dcode = dept_short_code(d)
+            tcode = task_code_map.get(tid, "")
+            ocode = obj_code_map.get(o.id, "")
+            pcode = f"{dcode}-{tcode}" if dcode and tcode else (f"{dcode}-{ocode}" if dcode and ocode else (tcode or ocode or dcode))
             out[str(tid)] = {
                 "objective_id": o.id,
-                "objective_code": obj_code_map.get(o.id, ""),
-                "task_code": task_code_map.get(tid, ""),
+                "objective_code": ocode,
+                "task_code": tcode,
+                "project_code": pcode,
                 "is_subtask_inherited": inherited,
                 "title": o.title,
+                "description": o.description,
+                "deadline": o.deadline,
+                "progress": float(o.progress or 0.0),
                 "level": "sub_objective" if o.parent_id else "objective",
                 "project_id": proj_id,
                 "project_name": proj_name,
-                "department": {"id": d.id, "name": d.name, "short_code": dept_short_code(d)},
+                "department": {"id": d.id, "name": d.name, "short_code": dcode},
                 "quarter": quarter_info(o.fiscal_year, o.quarter_number)["label"],
             }
     return success_response(data=out, message="Links fetched")
@@ -1700,7 +1708,7 @@ async def task_links(
 
 async def _task_or_404(db: AsyncSession, task_id: int):
     row = (await db.execute(
-        select(Task.id, Task.assigned_to_id, Task.assigned_by_id, Task.project_id).filter(Task.id == task_id, Task.is_deleted == False)
+        select(Task.id, Task.assigned_to_id, Task.assigned_by_id, Task.project_id, Task.deadline).filter(Task.id == task_id, Task.is_deleted == False)
     )).first()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -1724,15 +1732,16 @@ async def link_task(
         raise HTTPException(status_code=403, detail="You can only link tasks you created or that are assigned to you.")
     # a task linked to a Q3 objective is a Q3 task in the Task Center too (only quarter_id is touched)
     tq = await task_quarter_id(db, o.fiscal_year, o.quarter_number, create=True)
-    obj_project_id = o.project_id
-    if obj_project_id is None and o.parent_id:
-        parent_obj = await get_objective(db, o.parent_id)
-        obj_project_id = parent_obj.project_id
+    parent_obj = await get_objective(db, o.parent_id) if o.parent_id else None
+    obj_project_id = o.project_id if o.project_id is not None else (parent_obj.project_id if parent_obj else None)
+    obj_deadline = o.deadline or (parent_obj.deadline if parent_obj else None)
     update_vals: Dict[str, Any] = {}
     if tq:
         update_vals["quarter_id"] = tq
     if obj_project_id and task.project_id is None:
         update_vals["project_id"] = obj_project_id
+    if obj_deadline and not task.deadline:
+        update_vals["deadline"] = obj_deadline
     if update_vals:
         await db.execute(sa_update(Task).where(Task.id == link_in.task_id).values(**update_vals))
     existing = (await db.execute(select(ObjectiveTask).filter(ObjectiveTask.task_id == link_in.task_id))).scalars().first()
