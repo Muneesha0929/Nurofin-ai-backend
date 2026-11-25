@@ -27,6 +27,7 @@ class TargetDepartment(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    short_code = Column(String, nullable=True)
     hod_id = Column(Integer, ForeignKey("user.id"), nullable=True)
     created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
 
@@ -80,10 +81,13 @@ class DepartmentObjective(Base):
     deadline = Column(String, nullable=True)  # YYYY-MM-DD, like the rest of the codebase
     status = Column(String, default="not_started")  # not_started | in_progress | done
     progress = Column(Float, default=0.0)
+    progress_manual = Column(Boolean, default=False)
+    project_id = Column(Integer, ForeignKey("project.id"), nullable=True, index=True)
     sort_order = Column(Integer, default=0)
     created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
 
     owner = relationship("User", foreign_keys=[owner_id])
+    project = relationship("Project", foreign_keys=[project_id])
 
 
 class DepartmentObjectiveUpdate(Base):

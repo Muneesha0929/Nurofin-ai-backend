@@ -150,6 +150,7 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "scheduled_date": t.scheduled_date,
         "scheduled_start_time": t.scheduled_start_time,
         "scheduled_end_time": t.scheduled_end_time,
+        "comments_count": (cache.get("comment_counts") or {}).get(t.id, 0),
     }
 
 
@@ -348,6 +349,17 @@ async def read_tasks(
             cache['history_lookup'] = lookup
         except Exception:
             cache['history_lookup'] = {}
+
+    if top_ids:
+        try:
+            cc_rows = (await db.execute(
+                select(TaskComment.task_id, func.count(TaskComment.id))
+                .where(TaskComment.task_id.in_(top_ids), TaskComment.is_deleted == False)
+                .group_by(TaskComment.task_id)
+            )).all()
+            cache['comment_counts'] = {tid: cnt for tid, cnt in cc_rows}
+        except Exception:
+            cache['comment_counts'] = {}
 
     data = []
     for t in tasks:
@@ -586,6 +598,80 @@ async def _sync_task_status_to_issue(db: AsyncSession, task: Task, status: str):
         logging.getLogger(__name__).error(f"Failed to sync task status to issue: {e}")
 
 
+async def _would_create_cycle(db: AsyncSession, task_id: int, new_parent_id: Optional[int]) -> bool:
+    if not new_parent_id:
+        return False
+    if new_parent_id == task_id:
+        return True
+    cur = new_parent_id
+    seen = {task_id}
+    for _ in range(25):
+        if cur in seen:
+            return True
+        seen.add(cur)
+        r = await db.execute(select(Task.parent_id).filter(Task.id == cur, Task.is_deleted == False))
+        pid = r.scalar()
+        if not pid:
+            return False
+        cur = pid
+    return True
+
+
+@router.put("/bulk/parent")
+async def bulk_parent(
+    *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+    task_ids: List[int] = Query(...), parent_id: Optional[int] = Query(None),
+) -> Any:
+    """Move one or more existing tasks under a target parent task (or parent_id=0/None to make top-level)."""
+    target_parent_id = None if (parent_id is None or parent_id == 0) else parent_id
+    target_parent = None
+    if target_parent_id is not None:
+        pr = await db.execute(select(Task).filter(Task.id == target_parent_id, Task.is_deleted == False))
+        target_parent = pr.scalars().first()
+        if not target_parent:
+            return error_response(message="Target parent task not found")
+
+    r = await db.execute(select(Task).filter(Task.id.in_(task_ids), Task.is_deleted == False))
+    tasks_to_move = r.scalars().all()
+    affected_parents = set()
+    affected_projects = set()
+
+    for task in tasks_to_move:
+        if target_parent_id is not None and await _would_create_cycle(db, task.id, target_parent_id):
+            return error_response(message=f"Cannot move task '{task.title}' under itself or its own subtask")
+
+    for task in tasks_to_move:
+        old_parent_id = task.parent_id
+        if old_parent_id == target_parent_id:
+            continue
+        if old_parent_id:
+            affected_parents.add(old_parent_id)
+        if target_parent_id:
+            affected_parents.add(target_parent_id)
+        if task.project_id:
+            affected_projects.add(task.project_id)
+        if target_parent and target_parent.project_id and not task.project_id:
+            task.project_id = target_parent.project_id
+            affected_projects.add(target_parent.project_id)
+        if target_parent and target_parent.quarter_id and not task.quarter_id:
+            task.quarter_id = target_parent.quarter_id
+        task.parent_id = target_parent_id
+        await _add_history(
+            db, task.id, "parent_changed",
+            f"Moved under task #{target_parent_id}" if target_parent_id else "Detached to top-level task",
+            old_val=str(old_parent_id), new_val=str(target_parent_id), user_id=current_user.id,
+        )
+
+    await db.commit()
+    for p_id in affected_parents:
+        await _update_parent_task(db, p_id, current_user.id)
+        await _recalculate_parent_progress(db, p_id)
+    for proj_id in affected_projects:
+        await _recalculate_project_progress(db, proj_id)
+    await db.commit()
+    return success_response(message=f"Updated parent for {len(tasks_to_move)} tasks")
+
+
 @router.put("/{task_id}")
 async def update_task(
     *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
@@ -593,7 +679,7 @@ async def update_task(
     priority: str = None, deadline: str = None, start_date: str = None,
     estimated_hours: float = None, assigned_to_id: int = None,
     reviewer_id: int = None, progress: float = None,
-    project_id: int = None, quarter_id: int = None,
+    project_id: int = None, quarter_id: int = None, parent_id: int = None,
     actual_completion_date: str = None, extended_time: float = None,
     scheduled_date: str = None, scheduled_start_time: str = None, scheduled_end_time: str = None,
 ) -> Any:
@@ -603,6 +689,7 @@ async def update_task(
         return error_response(message="Task not found")
         
     old_project_id = task.project_id
+    old_parent_id = task.parent_id
     
     if title is not None:
         task.title = title
@@ -680,12 +767,35 @@ async def update_task(
         
     if quarter_id is not None:
         task.quarter_id = None if quarter_id == 0 else quarter_id
-        
+
+    if parent_id is not None:
+        new_parent_id = None if parent_id == 0 else parent_id
+        if new_parent_id != task.parent_id:
+            if new_parent_id is not None:
+                if await _would_create_cycle(db, task_id, new_parent_id):
+                    return error_response(message="Cannot move task under itself or one of its subtasks")
+                pr = await db.execute(select(Task).filter(Task.id == new_parent_id, Task.is_deleted == False))
+                new_parent = pr.scalars().first()
+                if not new_parent:
+                    return error_response(message="Target parent task not found")
+                if not task.project_id and new_parent.project_id:
+                    task.project_id = new_parent.project_id
+                if not task.quarter_id and new_parent.quarter_id:
+                    task.quarter_id = new_parent.quarter_id
+            task.parent_id = new_parent_id
+            await _add_history(
+                db, task_id, "parent_changed",
+                f"Moved under task #{new_parent_id}" if new_parent_id else "Detached to top-level task",
+                old_val=str(old_parent_id), new_val=str(new_parent_id), user_id=current_user.id,
+            )
+
     if progress is not None:
         task.progress = progress
         
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
+    if old_parent_id and old_parent_id != task.parent_id:
+        await _update_parent_task(db, old_parent_id, current_user.id)
 
     # Notify users mentioned in description if description was updated
     if description is not None and description.strip():
@@ -709,6 +819,8 @@ async def update_task(
         
     if task.parent_id:
         await _recalculate_parent_progress(db, task.parent_id)
+    if old_parent_id and old_parent_id != task.parent_id:
+        await _recalculate_parent_progress(db, old_parent_id)
         
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))
     task = r.scalars().first()
