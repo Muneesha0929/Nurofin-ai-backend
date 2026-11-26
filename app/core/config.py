@@ -39,8 +39,6 @@ class Settings(BaseSettings):
     RUNWAY_ALLOWED_EMAILS: str = ""
     # Local testing only: pretend today is this date (YYYY-MM-DD). Never set in production.
     RUNWAY_TODAY: str = ""
-    # Local testing only: pretend today is this date for priority pop-ups and shifted deadlines. Never set in production.
-    COS_TODAY: str = ""
     
     @property
     def SQLALCHEMY_DATABASE_URI(self) -> str:

@@ -22,7 +22,6 @@ class NotificationTypeEnum(str, enum.Enum):
     issue_followup = "issue_followup"
     issue_status_changed = "issue_status_changed"
     performance_reviewed = "performance_reviewed"
-    priority = "priority"
 
 class Notification(Base):
     id = Column(Integer, primary_key=True, index=True)

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Float, Text, Boolean, event, inspect as sa_inspect
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Float, Text, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from app.db.base_class import Base
@@ -25,8 +25,7 @@ class Task(Base):
     description = Column(Text, nullable=True)
     status = Column(Enum(TaskStatusEnum), default=TaskStatusEnum.todo)
     priority = Column(Enum(TaskPriorityEnum), default=TaskPriorityEnum.medium)
-    deadline = Column(String)  # the CURRENT deadline; changes go through "Extend deadline" with a reason
-    original_deadline = Column(String, nullable=True)  # the first deadline ever saved; never changes afterwards
+    deadline = Column(String)
     start_date = Column(String, nullable=True)
     scheduled_date = Column(String, nullable=True)
     scheduled_start_time = Column(String, nullable=True)
@@ -55,20 +54,3 @@ class Task(Base):
     subtasks = relationship("Task", back_populates="parent", primaryjoin="and_(Task.id==remote(Task.parent_id), Task.is_deleted==False)")
     project = relationship("Project", back_populates="tasks")
     meeting = relationship("Meeting")
-
-
-# Whatever code saves a first deadline (Task Center, meetings, imports), keep the original date.
-@event.listens_for(Task, "before_insert")
-def _remember_original_deadline_on_insert(mapper, connection, target):
-    if target.deadline and not target.original_deadline:
-        target.original_deadline = target.deadline
-
-
-@event.listens_for(Task, "before_update")
-def _remember_original_deadline_on_update(mapper, connection, target):
-    if target.original_deadline:
-        return
-    changed = sa_inspect(target).attrs.deadline.history
-    first = (changed.deleted[0] if changed.deleted else None) or target.deadline
-    if first:
-        target.original_deadline = first

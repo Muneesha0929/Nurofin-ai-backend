@@ -10,9 +10,7 @@ Who can do what:
 - HOD and members: read their own departments. Other departments are not visible to them.
 - Everyone signed in: the company line, the overall progress, company and monthly targets.
 """
-from datetime import date, datetime, timedelta
-import json
-import re
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -32,12 +30,9 @@ from app.models.department_target import (
     DepartmentObjectiveUpdate,
     DepartmentQuarterTarget,
     TargetDepartment,
-    TimelineEntry,
 )
 from app.models.notification import Notification, NotificationTypeEnum
-from app.models.project import Project
 from app.models.task import Task
-from app.models.task_comment import TaskComment
 from app.models.quarter import Quarter, QuarterStatusEnum
 from sqlalchemy import update as sa_update
 from app.models.user import User
@@ -55,28 +50,25 @@ from app.schemas.department_target import (
     WidgetOrder,
     WidgetUpdate,
     QuarterTargetUpdate,
-    DeadlineChange,
 )
-from app.services import cos_codes
-from app.services.cos_access import (  # noqa: F401  (re-exported: other modules import these from here)
-    DIRECTOR_ROLES,
-    cos_today,
-    is_ceo,
-    is_director,
-    iso_utc,
-    task_access,
-    user_role as _role,
-)
-from app.services.cos_codes import dept_short_code, normalize_short_code  # noqa: F401
-from app.services.cos_timeline import add_entry, clean_date, clean_reason, deadline_stats
 
 router = APIRouter()
 
+DIRECTOR_ROLES = ("ceo", "super_admin", "admin", "director", "chief_of_staff")
 OUTCOMES = {"achieved": "Achieved", "met_partly": "Met partly", "not_met": "Not met"}
 QUARTER_MONTHS = {1: ("Apr", "Jun"), 2: ("Jul", "Sep"), 3: ("Oct", "Dec"), 4: ("Jan", "Mar")}
 
 
 # ----------------------------------------------------------------- helpers
+
+def _role(user: User) -> str:
+    role = getattr(user, "role", "") or ""
+    return str(role.value if hasattr(role, "value") else role).lower()
+
+
+def is_director(user: User) -> bool:
+    return _role(user) in DIRECTOR_ROLES or user.id == 1
+
 
 def require_director(user: User) -> None:
     if not is_director(user):
@@ -133,17 +125,6 @@ async def get_department(db: AsyncSession, dept_id: int) -> TargetDepartment:
     return dept
 
 
-async def check_short_code_free(db: AsyncSession, code: Optional[str], except_id: Optional[int] = None) -> None:
-    """400 "##PROD is already used by Product" when another department already shows this prefix
-    (a typed short code, or the one it gets from its name)."""
-    if not code:
-        return
-    others = (await db.execute(select(TargetDepartment).filter(TargetDepartment.is_deleted == False))).scalars().all()
-    for d in others:
-        if d.id != except_id and dept_short_code(d) == code:
-            raise HTTPException(status_code=400, detail=f"##{code} is already used by {d.name}. Pick a different short code.")
-
-
 async def load_users(db: AsyncSession, ids: List[int]) -> List[User]:
     ids = list(dict.fromkeys(i for i in ids if i))
     if not ids:
@@ -180,97 +161,42 @@ def leaf_progress(o: DepartmentObjective) -> float:
     return 100.0 if o.status == "done" else float(o.progress or 0)
 
 
-def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    now_utc = datetime.utcnow()
-    if dt > now_utc + timedelta(minutes=15):
-        dt = dt - timedelta(hours=5, minutes=30)
-    s = dt.isoformat()
-    if not s.endswith("Z") and "+" not in s:
-        s += "Z"
-    return s
-
-
 def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[List[int]] = None,
-               tasks: Optional[Dict[int, List[Dict[str, Any]]]] = None,
-               dept_codes: Optional[Dict[int, str]] = None,
-               can_plan_dept: Optional[bool] = None,
-               user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+               tasks: Optional[Dict[int, List[Dict[str, Any]]]] = None) -> List[Dict[str, Any]]:
     """Objectives with their sub-objectives and linked Task Center tasks.
-    Progress rolls up from children/tasks unless the owner/assignee set a manual percentage.
-    Codes come from the stored numbers (cos_codes), `full_code` adds the department prefix when dept_codes is given."""
+    Progress rolls up: each sub-objective and each directly linked task counts as one item;
+    an item with nothing under it keeps the progress its owner set."""
     tasks = tasks or {}
-    dept_codes = dept_codes or {}
-    obj_by_id: Dict[int, DepartmentObjective] = {o.id: o for o in objs}
     children: Dict[Optional[int], List[DepartmentObjective]] = {}
     for o in objs:
         children.setdefault(o.parent_id, []).append(o)
     for lst in children.values():
-        lst.sort(key=lambda x: (x.seq or 0, x.id))
+        lst.sort(key=lambda x: (x.sort_order or 0, x.id))
 
-    def node(o: DepartmentObjective, parent_obj: Optional[DepartmentObjective] = None) -> Dict[str, Any]:
-        code = cos_codes.objective_code(o, obj_by_id)
-        dcode = dept_codes.get(o.department_id)
-        child_objs = children.get(o.id, [])
-        kids = [node(k, parent_obj=o) for k in child_objs]
-        linked = cos_codes.assign_task_codes(tasks.get(o.id, []), code, dcode)
-        parts = [k["progress"] for k in kids] + [100.0 if t["done"] else float(t.get("progress") or 0.0) for t in linked]
-        is_manual = bool(getattr(o, "progress_manual", False)) and not kids
-        if is_manual:
-            progress = leaf_progress(o)
-        elif parts:
-            progress = round(sum(parts) / len(parts), 1)
-        else:
-            progress = leaf_progress(o)
-        rolled = bool(parts) and not is_manual
+    def node(o: DepartmentObjective) -> Dict[str, Any]:
+        kids = [node(k) for k in children.get(o.id, [])]
+        linked = tasks.get(o.id, [])
+        parts = [k["progress"] for k in kids] + [100.0 if t["done"] else 0.0 for t in linked]
+        progress = round(sum(parts) / len(parts), 1) if parts else leaf_progress(o)
+        rolled = bool(parts)
         done = progress >= 100
-        eff_parent = parent_obj or (obj_by_id.get(o.parent_id) if o.parent_id else None)
-        proj = getattr(o, "project", None) or (getattr(eff_parent, "project", None) if eff_parent else None)
-        eff_project_id = o.project_id if o.project_id is not None else (eff_parent.project_id if eff_parent else None)
-        is_task_assignee = user_id is not None and any((t.get("assignee") or {}).get("id") == user_id for t in linked)
-        can_update_pct = (
-            user_id is not None
-            and not kids
-            and (
-                bool(can_plan_dept)
-                or o.owner_id == user_id
-                or (eff_parent is not None and eff_parent.owner_id == user_id)
-                or is_task_assignee
-            )
-        )
         return {
             "id": o.id,
             "parent_id": o.parent_id,
-            "code": code,
-            "full_code": cos_codes.full(dcode, code),
             "title": o.title,
             "description": o.description,
             "owner": user_brief(o.owner),
-            "project_id": eff_project_id,
-            "own_project_id": o.project_id,
-            "project_name": proj.name if proj else None,
-            "project": {"id": proj.id, "name": proj.name} if proj else None,
             "deadline": o.deadline,
-            "original_deadline": getattr(o, "_original_deadline", None) or o.deadline,
-            "deadline_changes": getattr(o, "_deadline_changes", 0),
-            "priority": o.priority,
-            "priority_set_at": iso_utc(o.priority_set_at),
             # a parent's status follows its children; a leaf keeps what its owner set
             "status": "done" if done else ("in_progress" if rolled and progress > 0 else ("not_started" if rolled else (o.status or "not_started"))),
             "progress": progress,
-            "progress_manual": bool(getattr(o, "progress_manual", False)),
-            "progress_from": "manual" if is_manual or not parts else ("tasks" if linked and not kids else "children"),
-            "can_update_progress": can_update_pct,
+            "progress_from": "tasks" if linked and not kids else ("children" if rolled else "manual"),
             "overdue": bool(o.deadline and o.deadline < today and not done),
             "tasks": linked,
             "children": kids,
         }
 
-    if root_ids is not None:
-        roots = [node(o, parent_obj=obj_by_id.get(o.parent_id) if o.parent_id else None) for o in objs if o.id in root_ids]
-    else:
-        roots = [node(o) for o in children.get(None, [])]
+    roots = [node(o) for o in objs if o.id in root_ids] if root_ids is not None else [node(o) for o in children.get(None, [])]
     for r in roots:
         r["health"] = health(r)
     return roots
@@ -331,7 +257,6 @@ def dept_payload(d: TargetDepartment) -> Dict[str, Any]:
     return {
         "id": d.id,
         "name": d.name,
-        "short_code": dept_short_code(d),
         "hod": user_brief(d.hod),
         "members": [user_brief(m) for m in d.members if not m.is_deleted],
     }
@@ -342,7 +267,7 @@ async def objectives_for(db: AsyncSession, dept_ids: List[int], fy: int, q: Opti
         return []
     stmt = (
         select(DepartmentObjective)
-        .options(selectinload(DepartmentObjective.owner), selectinload(DepartmentObjective.project))
+        .options(selectinload(DepartmentObjective.owner))
         .filter(
             DepartmentObjective.department_id.in_(dept_ids),
             DepartmentObjective.fiscal_year == fy,
@@ -351,13 +276,7 @@ async def objectives_for(db: AsyncSession, dept_ids: List[int], fy: int, q: Opti
     )
     if q is not None:
         stmt = stmt.filter(DepartmentObjective.quarter_number == q)
-    objs = list((await db.execute(stmt)).scalars().all())
-    stats = await deadline_stats(db, "objective", [o.id for o in objs])
-    for o in objs:  # read by build_tree: first deadline and how often it moved
-        st = stats.get(o.id)
-        o._original_deadline = (st["original"] if st else None) or o.deadline
-        o._deadline_changes = st["changes"] if st else 0
-    return objs
+    return list((await db.execute(stmt)).scalars().all())
 
 
 def _status(v) -> str:
@@ -366,175 +285,30 @@ def _status(v) -> str:
 
 async def tasks_for(db: AsyncSession, objective_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
     """Task Center tasks linked to these objectives, keyed by objective id.
-    Includes task descriptions, follow-up comments, and nested subtasks."""
+    Reads only columns the Task Center itself already uses; deleted tasks are left out."""
     if not objective_ids:
         return {}
-    link_rows = (await db.execute(
-        select(ObjectiveTask.objective_id, Task, ObjectiveTask.seq)
+    rows = (await db.execute(
+        select(ObjectiveTask.objective_id, Task.id, Task.title, cast(Task.status, String), Task.deadline, Task.assigned_to_id)
         .join(Task, Task.id == ObjectiveTask.task_id)
         .filter(ObjectiveTask.objective_id.in_(objective_ids), ObjectiveTask.is_deleted == False, Task.is_deleted == False)
-        .order_by(ObjectiveTask.seq, Task.id)
+        .order_by(Task.id)
     )).all()
-    if not link_rows:
-        return {}
-    rows = [(oid, t) for oid, t, _ in link_rows]
-    link_seq: Dict[int, int] = {t.id: seq for _, t, seq in link_rows}
-
-    root_tasks = [t for _, t in rows]
-    all_tasks_by_id: Dict[int, Task] = {t.id: t for t in root_tasks}
-    children_by_parent: Dict[int, List[Task]] = {}
-
-    # Iteratively load subtasks up to 5 levels deep
-    frontier = [t.id for t in root_tasks]
-    for _ in range(5):
-        if not frontier:
-            break
-        sub_rows = (await db.execute(
-            select(Task)
-            .filter(Task.parent_id.in_(frontier), Task.is_deleted == False)
-            .order_by(Task.id)
-        )).scalars().all()
-        next_frontier = []
-        for st in sub_rows:
-            children_by_parent.setdefault(st.parent_id, []).append(st)
-            if st.id not in all_tasks_by_id:
-                all_tasks_by_id[st.id] = st
-                next_frontier.append(st.id)
-        frontier = next_frontier
-
-    all_tids = list(all_tasks_by_id.keys())
-
-    # Batch-load comments / follow-ups for all linked tasks and subtasks
-    comment_rows = (await db.execute(
-        select(TaskComment)
-        .filter(TaskComment.task_id.in_(all_tids), TaskComment.is_deleted == False)
-        .order_by(TaskComment.created_at.asc(), TaskComment.id.asc())
-    )).scalars().all()
-
-    # Collect all user IDs and project IDs needed
-    uids = set()
-    pids = set()
-    for t in all_tasks_by_id.values():
-        if t.assigned_to_id:
-            uids.add(t.assigned_to_id)
-        if t.assigned_by_id:
-            uids.add(t.assigned_by_id)
-        if t.project_id:
-            pids.add(t.project_id)
-    for c in comment_rows:
-        if c.user_id:
-            uids.add(c.user_id)
-
-    people: Dict[int, User] = {}
+    people = {}
+    uids = {r[5] for r in rows if r[5]}
     if uids:
         people = {u.id: u for u in (await db.execute(select(User).filter(User.id.in_(uids)))).scalars().all()}
-
-    task_stats = await deadline_stats(db, "task", all_tids)
-
-    projects_map: Dict[int, str] = {}
-    if pids:
-        projects_map = {p.id: p.name for p in (await db.execute(select(Project).filter(Project.id.in_(pids)))).scalars().all()}
-
-    # Group comments per task with nested replies
-    comments_by_task: Dict[int, List[Dict[str, Any]]] = {}
-    comments_map: Dict[int, Dict[str, Any]] = {}
-    for c in comment_rows:
-        attachments_data = []
-        is_followup = False
-        completed_by_name = None
-        completed_at = None
-        if c.attachments:
-            try:
-                parsed = json.loads(c.attachments)
-                if isinstance(parsed, dict):
-                    attachments_data = parsed.get("files", [])
-                    is_followup = bool(parsed.get("is_followup_completed", False))
-                    completed_by_name = parsed.get("completed_by_name")
-                    completed_at = parsed.get("completed_at")
-                elif isinstance(parsed, list):
-                    attachments_data = parsed
-            except Exception:
-                attachments_data = [{"name": "Attachment", "url": c.attachments}]
-
-        u = people.get(c.user_id)
-        c_dict = {
-            "id": c.id,
-            "task_id": c.task_id,
-            "user_id": c.user_id,
-            "user_name": (u.full_name or u.email) if u else "Unknown User",
-            "user_avatar": u.profile_picture if u else None,
-            "content": c.content,
-            "parent_id": c.parent_id,
-            "attachments": attachments_data,
-            "is_followup_completed": is_followup,
-            "completed_by_name": completed_by_name,
-            "completed_at": completed_at,
-            "created_at": _iso_utc(c.created_at),
-            "replies": [],
-        }
-        comments_map[c.id] = c_dict
-
-    for cid, c_dict in comments_map.items():
-        pid = c_dict["parent_id"]
-        if pid and pid in comments_map:
-            comments_map[pid]["replies"].append(c_dict)
-        else:
-            comments_by_task.setdefault(c_dict["task_id"], []).append(c_dict)
-
     today = date.today().isoformat()
-
-    def serialize_task_node(t: Task, visited: set) -> Optional[Dict[str, Any]]:
-        if t.id in visited:
-            return None
-        visited.add(t.id)
-        st = _status(t.status)
-        done = st in ("completed", "done")
-        dl = (t.deadline or "")[:10] or None
-        followups = comments_by_task.get(t.id, [])
-        pending_followups = sum(1 for f in followups if not f.get("is_followup_completed"))
-        sub_nodes = []
-        for child in children_by_parent.get(t.id, []):
-            node_c = serialize_task_node(child, visited)
-            if node_c is not None:
-                sub_nodes.append(node_c)
-        return {
-            "id": t.id,
-            "parent_id": t.parent_id,
-            "title": t.title,
-            "description": t.description,
-            "status": st,
-            "priority": _status(t.priority) if t.priority else "medium",
-            "done": done,
-            "start_date": (t.start_date or "")[:10] or None,
-            "deadline": dl,
-            "original_deadline": (t.original_deadline or "")[:10] or (task_stats.get(t.id) or {}).get("original") or dl,
-            "deadline_changes": (task_stats.get(t.id) or {}).get("changes", 0),
-            "seq": link_seq.get(t.id),
-            "progress": float(t.progress or 0.0),
-            "overdue": bool(dl and dl < today and not done),
-            "project_id": t.project_id,
-            "project_name": projects_map.get(t.project_id) if t.project_id else None,
-            "quarter_id": t.quarter_id,
-            "assignee": user_brief(people.get(t.assigned_to_id)),
-            "assigned_by": user_brief(people.get(t.assigned_by_id)),
-            "followups": followups,
-            "followup_count": len(followups),
-            "pending_followup_count": pending_followups,
-            "subtasks": sub_nodes,
-        }
-
-    oid_task_ids: Dict[int, set] = {}
-    for oid, t in rows:
-        oid_task_ids.setdefault(oid, set()).add(t.id)
-
     out: Dict[int, List[Dict[str, Any]]] = {}
-    for oid, t in rows:
-        # If this task's parent is also linked to the same objective, it renders nested under that parent
-        if t.parent_id and t.parent_id in oid_task_ids.get(oid, set()):
-            continue
-        serialized = serialize_task_node(t, set())
-        if serialized is not None:
-            out.setdefault(oid, []).append(serialized)
+    for oid, tid, title, status, deadline, uid in rows:
+        st = _status(status)
+        done = st in ("completed", "done")
+        dl = (deadline or "")[:10] or None
+        out.setdefault(oid, []).append({
+            "id": tid, "title": title, "status": st, "done": done, "deadline": dl,
+            "overdue": bool(dl and dl < today and not done),
+            "assignee": user_brief(people.get(uid)),
+        })
     return out
 
 
@@ -608,12 +382,11 @@ async def overview(
     for o in objs:
         by_dept.setdefault(o.department_id, []).append(o)
 
-    dept_codes = {d.id: dept_short_code(d) for d in depts}
     departments, new_targets, totals = [], [], {"objectives": 0, "items": 0, "done": 0, "overdue": 0}
     progress_values = []
     for d in depts:
         t = targets.get(d.id)
-        tree = build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks, dept_codes=dept_codes)
+        tree = build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks)
         stats = summarize(tree)
         for k in totals:
             totals[k] += stats[k]
@@ -700,9 +473,7 @@ async def create_department(
         raise HTTPException(status_code=400, detail="A department with this name already exists.")
     hod = (await load_users(db, [dept_in.hod_id]))[0] if dept_in.hod_id else None
     members = await load_users(db, [i for i in dept_in.member_ids if i != dept_in.hod_id])
-    sc = normalize_short_code(dept_in.short_code)
-    await check_short_code_free(db, sc)
-    dept = TargetDepartment(name=name, short_code=sc, hod=hod, created_by_id=current_user.id, members=members)
+    dept = TargetDepartment(name=name, hod=hod, created_by_id=current_user.id, members=members)
     db.add(dept)
     await db.commit()
     dept = await get_department(db, dept.id)
@@ -727,11 +498,6 @@ async def update_department(
         if clash:
             raise HTTPException(status_code=400, detail="A department with this name already exists.")
         dept.name = name
-    if "short_code" in fields:
-        new_code = normalize_short_code(dept_in.short_code)
-        if new_code != dept_short_code(dept):
-            await check_short_code_free(db, new_code, except_id=dept_id)
-        dept.short_code = new_code
     if "hod_id" in fields:
         # set the relationship, not just the id: the session keeps loaded objects after commit
         dept.hod = (await load_users(db, [dept_in.hod_id]))[0] if dept_in.hod_id else None
@@ -773,7 +539,6 @@ async def restore_department(
         )).scalars().first()
         if clash:
             raise HTTPException(status_code=400, detail="Another department now has this name. Rename it first, then undo.")
-        await check_short_code_free(db, normalize_short_code(dept.short_code), except_id=dept_id)  # only a typed code must be unique
         dept.is_deleted = False
         await db.commit()
     dept = await get_department(db, dept_id)
@@ -812,14 +577,7 @@ async def department_detail(
     quarters = []
     for q in (1, 2, 3, 4):
         t = targets.get(q)
-        tree = build_tree(
-            [o for o in objs if o.quarter_number == q],
-            today,
-            tasks=linked_tasks,
-            dept_codes={dept.id: dept_short_code(dept)},
-            can_plan_dept=planner,
-            user_id=current_user.id,
-        )
+        tree = build_tree([o for o in objs if o.quarter_number == q], today, tasks=linked_tasks)
         quarters.append({
             **quarter_info(fy, q),
             **target_payload(t),
@@ -830,7 +588,6 @@ async def department_detail(
 
     return success_response(data={
         **dept_payload(dept),
-        "me": current_user.id,
         "fiscal_year": fy,
         "fy_label": f"FY {fy}-{str(fy + 1)[-2:]}",
         "current": dict(zip(("fiscal_year", "quarter_number"), current_quarter())),
@@ -957,7 +714,6 @@ async def create_objective(
     dept = await get_department(db, obj_in.department_id)
     if not can_plan(current_user, dept):
         raise HTTPException(status_code=403, detail="Only the HOD of this department or the Director can add objectives.")
-    parent = None
     if obj_in.parent_id:
         parent = await get_objective(db, obj_in.parent_id)
         if (parent.department_id, parent.fiscal_year, parent.quarter_number) != (dept.id, obj_in.fiscal_year, obj_in.quarter_number):
@@ -966,16 +722,15 @@ async def create_objective(
             raise HTTPException(status_code=400, detail="Sub-objectives cannot have their own sub-objectives. Add tasks from the Task center instead.")
     if obj_in.owner_id:
         await load_users(db, [obj_in.owner_id])
-    project_id = obj_in.project_id if obj_in.project_id else (parent.project_id if parent else None)
-    if project_id:
-        proj = (await db.execute(select(Project).filter(Project.id == project_id, Project.is_deleted == False))).scalars().first()
-        if not proj:
-            raise HTTPException(status_code=404, detail="Project not found.")
-    # the number is taken from a locked counter, so two people adding at once never get the same code
-    if parent:
-        seq = await cos_codes.next_child_seq(db, parent.id)
-    else:
-        seq = await cos_codes.next_objective_seq(db, dept.id, obj_in.fiscal_year, obj_in.quarter_number)
+    siblings = (await db.execute(
+        select(DepartmentObjective).filter(
+            DepartmentObjective.department_id == dept.id,
+            DepartmentObjective.fiscal_year == obj_in.fiscal_year,
+            DepartmentObjective.quarter_number == obj_in.quarter_number,
+            DepartmentObjective.parent_id == obj_in.parent_id,
+            DepartmentObjective.is_deleted == False,
+        )
+    )).scalars().all()
     o = DepartmentObjective(
         department_id=dept.id,
         fiscal_year=obj_in.fiscal_year,
@@ -984,12 +739,10 @@ async def create_objective(
         title=obj_in.title.strip(),
         description=(obj_in.description or "").strip() or None,
         owner_id=obj_in.owner_id,
-        project_id=project_id,
         deadline=obj_in.deadline,
         status="not_started",
         progress=0.0,
-        seq=seq,
-        sort_order=seq,
+        sort_order=len(siblings),
         created_by_id=current_user.id,
     )
     db.add(o)
@@ -1003,65 +756,7 @@ async def create_objective(
             link=f"/departments?id={dept.id}",
         ))
     await db.commit()
-    code = await cos_codes.objective_full_code(db, o, dept)
-    return success_response(data={"id": o.id, "code": code.split("-", 1)[-1], "full_code": code}, message="Objective added")
-
-
-PRIORITY_RANK = {"P1": 1, "P2": 2, "P3": 3}
-
-
-async def priority_recipients(db: AsyncSession, objectives: List[DepartmentObjective]) -> Dict[int, set]:
-    """{objective_id: user ids who should see its priority}: its owner, the owners of its sub-objectives,
-    the assignees of tasks linked to it or to its sub-objectives, and the department HOD. Three queries for any number of objectives."""
-    if not objectives:
-        return {}
-    ids = [o.id for o in objectives]
-    kids = (await db.execute(
-        select(DepartmentObjective.id, DepartmentObjective.parent_id, DepartmentObjective.owner_id)
-        .where(DepartmentObjective.parent_id.in_(ids), DepartmentObjective.is_deleted == False)
-    )).all()
-    owner_of_kid = {kid_id: owner for kid_id, _, owner in kids}
-    parent_of_kid = {kid_id: parent for kid_id, parent, _ in kids}
-    dept_ids = {o.department_id for o in objectives}
-    hods = {d: h for d, h in (await db.execute(select(TargetDepartment.id, TargetDepartment.hod_id).where(TargetDepartment.id.in_(dept_ids)))).all()}
-    link_rows = (await db.execute(
-        select(ObjectiveTask.objective_id, Task.assigned_to_id)
-        .join(Task, Task.id == ObjectiveTask.task_id)
-        .where(ObjectiveTask.objective_id.in_(ids + list(parent_of_kid)), ObjectiveTask.is_deleted == False, Task.is_deleted == False)
-    )).all()
-    out: Dict[int, set] = {o.id: {o.owner_id, hods.get(o.department_id)} for o in objectives}
-    for kid_id, parent in parent_of_kid.items():
-        out[parent].add(owner_of_kid.get(kid_id))
-    for oid, assignee in link_rows:
-        out.setdefault(oid, set()).add(assignee)
-        if oid in parent_of_kid:
-            out[parent_of_kid[oid]].add(assignee)
-    return {oid: {u for u in users if u} for oid, users in out.items()}
-
-
-async def _set_priority(db: AsyncSession, o: DepartmentObjective, dept: TargetDepartment, new: Optional[str], by: User) -> None:
-    """CEO only (checked by the caller). Setting or raising a priority puts a bell notification on everyone it concerns."""
-    old = o.priority
-    new = new or None
-    if new == old:
-        return
-    o.priority = new
-    o.priority_set_at = datetime.utcnow() if new else None
-    o.priority_set_by_id = by.id if new else None
-    raised = bool(new) and (old is None or PRIORITY_RANK[new] < PRIORITY_RANK[old])
-    if not raised:
-        return
-    recipients = (await priority_recipients(db, [o]))[o.id] - {by.id}
-    code = await cos_codes.objective_full_code(db, o, dept)
-    who = by.full_name or by.email
-    for uid in sorted(recipients):
-        db.add(Notification(
-            title=f"{new} priority: {code}",
-            message=f"{who} marked \"{o.title}\" as {new} priority.",
-            type=NotificationTypeEnum.priority,
-            user_id=uid,
-            link=cos_codes.objective_link(o.department_id, o.id),
-        ))
+    return success_response(data={"id": o.id}, message="Objective added")
 
 
 @router.put("/objectives/{obj_id}", response_model=APIResponse)
@@ -1075,31 +770,9 @@ async def update_objective(
     dept = await get_department(db, o.department_id)
     planner = can_plan(current_user, dept)
     owner = o.owner_id == current_user.id
-    if not owner and o.parent_id:
-        parent_obj = await get_objective(db, o.parent_id)
-        if parent_obj.owner_id == current_user.id:
-            owner = True
-    is_task_assignee = False
-    if not planner and not owner:
-        assigned_link = (await db.execute(
-            select(ObjectiveTask.id)
-            .join(Task, Task.id == ObjectiveTask.task_id)
-            .filter(
-                ObjectiveTask.objective_id == o.id,
-                ObjectiveTask.is_deleted == False,
-                Task.is_deleted == False,
-                Task.assigned_to_id == current_user.id,
-            )
-        )).first()
-        is_task_assignee = bool(assigned_link)
     fields = obj_in.model_fields_set
-    if "priority" in fields and not is_ceo(current_user):
-        raise HTTPException(status_code=403, detail="Only the CEO can set priorities.")
-    can_progress = owner or is_task_assignee
-    if not planner:
-        allowed_fields = {"status", "progress"} if not owner else {"status", "progress", "project_id"}
-        if not can_progress or not (fields <= allowed_fields):
-            raise HTTPException(status_code=403, detail="You can only update progress on objectives or targets assigned to you.")
+    if not planner and not (owner and fields <= {"status", "progress"}):
+        raise HTTPException(status_code=403, detail="You can only update progress on objectives assigned to you.")
 
     if "title" in fields and obj_in.title is not None:
         o.title = obj_in.title.strip()
@@ -1109,41 +782,18 @@ async def update_objective(
         if obj_in.owner_id:
             await load_users(db, [obj_in.owner_id])
         o.owner_id = obj_in.owner_id or None
-    if "project_id" in fields:
-        if obj_in.project_id:
-            proj = (await db.execute(select(Project).filter(Project.id == obj_in.project_id, Project.is_deleted == False))).scalars().first()
-            if not proj:
-                raise HTTPException(status_code=404, detail="Project not found.")
-            o.project_id = obj_in.project_id
-        else:
-            o.project_id = None
     if "deadline" in fields:
-        new_dl = (obj_in.deadline or None)
-        if o.deadline and new_dl != o.deadline:
-            raise HTTPException(status_code=400, detail="Use Extend deadline and give a reason.")
-        if new_dl and not o.deadline:
-            o.deadline = new_dl
-            add_entry(db, "objective", o.id, "date_change", current_user.id, old_date=None, new_date=new_dl, text="Deadline set")
+        o.deadline = obj_in.deadline
     if "status" in fields and obj_in.status is not None:
-        reopened = o.status == "done" and obj_in.status != "done"
         o.status = obj_in.status
         if obj_in.status == "done":
             o.progress = 100.0
-            o.progress_manual = True
-        elif reopened:
-            # leaving "done" hands the percentage back to the tasks / sub-objectives (a bare objective starts again at 0)
-            o.progress_manual = False
-            if (o.progress or 0) >= 100:
-                o.progress = 0.0
     if "progress" in fields and obj_in.progress is not None:
         o.progress = obj_in.progress
-        o.progress_manual = True
         if obj_in.progress >= 100:
             o.status = "done"
         elif o.status == "done" or (o.status == "not_started" and obj_in.progress > 0):
             o.status = "in_progress"
-    if "priority" in fields:
-        await _set_priority(db, o, dept, obj_in.priority, current_user)
     await db.commit()
     return success_response(data={"id": o.id}, message="Objective saved")
 
@@ -1179,21 +829,8 @@ async def objective_detail(
     dept = await get_department(db, o.department_id)
     require_see(current_user, dept)
     today = date.today().isoformat()
-    all_objs = await objectives_for(db, [dept.id], o.fiscal_year, o.quarter_number)
-    code_map = {x.id: cos_codes.objective_code(x, {y.id: y for y in all_objs}) for x in all_objs}
-    dcode = dept_short_code(dept)
-
-    planner = can_plan(current_user, dept)
-    family = [x for x in all_objs if x.id == o.id or x.parent_id == o.id or (o.parent_id and x.id == o.parent_id)]
-    node = build_tree(
-        family,
-        today,
-        root_ids=[o.id],
-        tasks=await tasks_for(db, [x.id for x in family]),
-        dept_codes={dept.id: dcode},
-        can_plan_dept=planner,
-        user_id=current_user.id,
-    )[0]
+    family = [x for x in await objectives_for(db, [dept.id], o.fiscal_year, o.quarter_number) if x.id == o.id or x.parent_id == o.id]
+    node = build_tree(family, today, root_ids=[o.id], tasks=await tasks_for(db, [x.id for x in family]))[0]
     parent = await get_objective(db, o.parent_id) if o.parent_id else None
     target = (await db.execute(
         select(DepartmentQuarterTarget).filter(
@@ -1209,28 +846,22 @@ async def objective_detail(
         .filter(DepartmentObjectiveUpdate.objective_id == o.id, DepartmentObjectiveUpdate.is_deleted == False)
         .order_by(DepartmentObjectiveUpdate.created_at)
     )).scalars().all()
+    planner = can_plan(current_user, dept)
     return success_response(data={
         **node,
         "description": o.description,
         "level": "sub_objective" if o.parent_id else "objective",
-        "department": {
-            "id": dept.id,
-            "name": dept.name,
-            "short_code": dept_short_code(dept),
-            "hod": user_brief(dept.hod),
-            "members": [user_brief(m) for m in dept.members if not m.is_deleted],
-        },
+        "department": {"id": dept.id, "name": dept.name, "hod": user_brief(dept.hod), "members": [user_brief(m) for m in dept.members if not m.is_deleted]},
         "quarter": quarter_info(o.fiscal_year, o.quarter_number),
         "director_message": target.message if target else None,
-        "parent": {"id": parent.id, "title": parent.title, "code": code_map.get(parent.id), "full_code": cos_codes.full(dcode, code_map.get(parent.id)), "project_id": parent.project_id} if parent else None,
+        "parent": {"id": parent.id, "title": parent.title} if parent else None,
         "updates": [
             {"id": u.id, "user": user_brief(u.user), "text": u.text, "created_at": u.created_at.isoformat() if u.created_at else None}
             for u in updates
         ],
         "permissions": {
             "can_plan": planner,
-            "can_update_progress": node["can_update_progress"],
-            "can_edit_project": planner or (o.owner_id == current_user.id),
+            "can_update_progress": not node["children"] and not node["tasks"] and (planner or o.owner_id == current_user.id),
             "can_post": can_post_update(current_user, dept, o),
         },
     }, message="Objective fetched")
@@ -1263,197 +894,6 @@ async def post_objective_update(
         ))
     await db.commit()
     return success_response(data={"id": u.id}, message="Update posted")
-
-
-@router.post("/objectives/{obj_id}/deadline", response_model=APIResponse)
-async def change_objective_deadline(
-    obj_id: int,
-    body: DeadlineChange,
-    db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    """Move an objective's deadline. A reason is required and stays on its timeline.
-    Allowed for the HOD, the Director and the owner (of the objective, or of its parent)."""
-    o = await get_objective(db, obj_id)
-    dept = await get_department(db, o.department_id)
-    parent_owner = None
-    if o.parent_id:
-        parent_owner = (await get_objective(db, o.parent_id)).owner_id
-    if not (can_plan(current_user, dept) or current_user.id in (o.owner_id, parent_owner)):
-        raise HTTPException(status_code=403, detail="Only the HOD, the Director or the owner can change this deadline.")
-    new_date = clean_date(body.new_date)
-    reason = clean_reason(body.reason)
-    old = (o.deadline or "")[:10] or None
-    if new_date == old:
-        raise HTTPException(status_code=400, detail="That is already the deadline.")
-    o.deadline = new_date
-    add_entry(db, "objective", o.id, "date_change", current_user.id, old_date=old, new_date=new_date, text=reason)
-    await db.commit()
-    st = (await deadline_stats(db, "objective", [o.id])).get(o.id, {})
-    return success_response(data={
-        "id": o.id, "deadline": o.deadline, "original_deadline": st.get("original") or o.deadline, "deadline_changes": st.get("changes", 0),
-    }, message="Deadline changed")
-
-
-# ----------------------------------------------------------------- resolve a typed code
-
-async def _find_in_quarter(db: AsyncSession, dept: TargetDepartment, fy: int, q: int, path: List[int]) -> Optional[Dict[str, Any]]:
-    """Walk a code like [1, 2, 3, 1] down the stored numbers. Returns the objective chain and the task chain, or None."""
-    top = (await db.execute(select(DepartmentObjective).filter(
-        DepartmentObjective.department_id == dept.id, DepartmentObjective.fiscal_year == fy, DepartmentObjective.quarter_number == q,
-        DepartmentObjective.parent_id == None, DepartmentObjective.seq == path[0], DepartmentObjective.is_deleted == False,
-    ))).scalars().first()
-    if not top:
-        return None
-    objectives = [top]
-    tasks: List[Task] = []
-    i = 1
-    if i < len(path):
-        sub = (await db.execute(select(DepartmentObjective).filter(
-            DepartmentObjective.parent_id == top.id, DepartmentObjective.seq == path[i], DepartmentObjective.is_deleted == False,
-        ))).scalars().first()
-        if sub:
-            objectives.append(sub)
-            i += 1
-    if i < len(path):
-        link_task = (await db.execute(
-            select(Task).join(ObjectiveTask, ObjectiveTask.task_id == Task.id).filter(
-                ObjectiveTask.objective_id == objectives[-1].id, ObjectiveTask.seq == path[i],
-                ObjectiveTask.is_deleted == False, Task.is_deleted == False,
-            )
-        )).scalars().first()
-        if not link_task:
-            return None
-        tasks.append(link_task)
-        i += 1
-        while i < len(path):
-            kids = (await db.execute(select(Task).filter(Task.parent_id == tasks[-1].id, Task.is_deleted == False).order_by(Task.id))).scalars().all()
-            if path[i] > len(kids):
-                return None
-            tasks.append(kids[path[i] - 1])
-            i += 1
-    return {"objectives": objectives, "tasks": tasks}
-
-
-@router.get("/resolve", response_model=APIResponse)
-async def resolve_code(
-    code: str = Query(..., max_length=60),
-    fiscal_year: Optional[int] = Query(None),
-    quarter: Optional[int] = Query(None),
-    db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    """Turn a typed code (PROD-1.2.3, ##prod-1.2, PROD) into the item it names.
-    A code is numbered inside one quarter. Without fiscal_year + quarter the current quarter is tried first, then newer to older."""
-    parsed = cos_codes.parse_code(code)
-    not_found = HTTPException(status_code=404, detail="No item with that code was found.")
-    if not parsed:
-        raise not_found
-    dept_code, path = parsed
-    depts = [d for d in (await db.execute(
-        select(TargetDepartment).options(selectinload(TargetDepartment.hod), selectinload(TargetDepartment.members))
-        .filter(TargetDepartment.is_deleted == False).order_by(TargetDepartment.id)
-    )).scalars().all() if dept_short_code(d) == dept_code and can_see(current_user, d)]
-    if not depts:
-        raise not_found
-    cur = current_quarter()
-
-    if not path:  # the department itself
-        dept = depts[0]
-        fy, q = (fiscal_year, quarter) if fiscal_year and quarter else cur
-        check_quarter(fy, q)
-        objs = await objectives_for(db, [dept.id], fy, q)
-        tree = build_tree(objs, date.today().isoformat(), tasks=await tasks_for(db, [x.id for x in objs]), dept_codes={dept.id: dept_code})
-        return success_response(data={
-            "kind": "department", "full_code": dept_code, "title": dept.name, "status": None,
-            "progress": summarize(tree)["progress"], "deadline": None, "original_deadline": None, "priority": None, "owner": user_brief(dept.hod),
-            "department": {"id": dept.id, "name": dept.name, "short_code": dept_code},
-            "quarter": quarter_info(fy, q),
-            "breadcrumb": [{"kind": "department", "code": dept_code, "full_code": dept_code, "title": dept.name, "id": dept.id}],
-            "link": f"/departments?id={dept.id}", "can_edit": is_director(current_user),
-        }, message="Code found")
-
-    if fiscal_year and quarter:
-        check_quarter(fiscal_year, quarter)
-        quarters = [(fiscal_year, quarter)]
-    else:
-        have = {(fy, q) for fy, q in (await db.execute(
-            select(DepartmentObjective.fiscal_year, DepartmentObjective.quarter_number)
-            .filter(DepartmentObjective.department_id.in_([d.id for d in depts]), DepartmentObjective.is_deleted == False).distinct()
-        )).all()}
-        quarters = sorted(have, key=lambda fq: (fq != cur, -fq[0], -fq[1]))
-    hit = None
-    for dept in depts:
-        for fy, q in quarters:
-            found = await _find_in_quarter(db, dept, fy, q, path)
-            if found:
-                hit = (dept, fy, q, found)
-                break
-        if hit:
-            break
-    if not hit:
-        raise not_found
-    dept, fy, q, found = hit
-    objectives, tasks = found["objectives"], found["tasks"]
-
-    # progress and status come from the same roll-up the department page shows
-    all_objs = await objectives_for(db, [dept.id], fy, q)
-    tree = build_tree(all_objs, date.today().isoformat(), tasks=await tasks_for(db, [x.id for x in all_objs]), dept_codes={dept.id: dept_code},
-                      can_plan_dept=can_plan(current_user, dept), user_id=current_user.id)
-    nodes: Dict[int, Dict[str, Any]] = {}
-    task_nodes: Dict[int, Dict[str, Any]] = {}
-
-    def index(ns: List[Dict[str, Any]]):
-        def walk_t(ts):
-            for t in ts:
-                task_nodes[t["id"]] = t
-                walk_t(t.get("subtasks") or [])
-        for n in ns:
-            nodes[n["id"]] = n
-            walk_t(n.get("tasks") or [])
-            index(n.get("children") or [])
-    index(tree)
-
-    crumbs = [{"kind": "department", "code": dept_code, "full_code": dept_code, "title": dept.name, "id": dept.id}]
-    for k, ob in enumerate(objectives):
-        n = nodes.get(ob.id) or {}
-        crumbs.append({"kind": "objective", "code": n.get("code"), "full_code": n.get("full_code"), "title": ob.title, "id": ob.id})
-    for k, t in enumerate(tasks):
-        n = task_nodes.get(t.id) or {}
-        crumbs.append({"kind": "task", "code": n.get("code"), "full_code": n.get("full_code"), "title": t.title, "id": t.id})
-    last = crumbs[-1]
-
-    base = {
-        "full_code": last["full_code"], "title": last["title"],
-        "department": {"id": dept.id, "name": dept.name, "short_code": dept_code},
-        "quarter": quarter_info(fy, q), "breadcrumb": crumbs,
-    }
-    if tasks:
-        t = tasks[-1]
-        n = task_nodes.get(t.id) or {}
-        access = (await task_access(db, current_user, [t]))[t.id]
-        stats = (await deadline_stats(db, "task", [t.id])).get(t.id, {})
-        dl = (t.deadline or "")[:10] or None
-        data = {**base, "kind": "task", "status": _status(t.status), "progress": float(t.progress or 0.0), "deadline": dl,
-                "original_deadline": (t.original_deadline or "")[:10] or stats.get("original") or dl,
-                # P1-P3 live on objectives: a task shows the priority of the objective it sits under.
-                "priority": objectives[-1].priority if objectives else None,
-                "task_priority": _status(t.priority) if t.priority else None,
-                "owner": n.get("assignee") if n else user_brief(await db.get(User, t.assigned_to_id) if t.assigned_to_id else None),
-                "objective_id": objectives[-1].id, "task_id": t.id, "link": cos_codes.task_link(t.id),
-                "can_edit": access["edit"]}
-        if not n:
-            data["full_code"] = last["full_code"] or ""
-        return success_response(data=data, message="Code found")
-    ob = objectives[-1]
-    n = nodes.get(ob.id) or {}
-    owner_ok = current_user.id == ob.owner_id
-    return success_response(data={
-        **base, "kind": "objective", "status": n.get("status"), "progress": n.get("progress"), "deadline": ob.deadline,
-        "original_deadline": n.get("original_deadline") or ob.deadline, "priority": ob.priority,
-        "owner": user_brief(ob.owner) if ob.owner_id else None,
-        "objective_id": ob.id, "link": cos_codes.objective_link(dept.id, ob.id), "can_edit": can_plan(current_user, dept) or owner_ok,
-    }, message="Code found")
 
 
 @router.get("/deadlines", response_model=APIResponse)
@@ -1631,9 +1071,9 @@ async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User
             step = "quarter target"
             await conn.execute(md["cos_quarter_target"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, message="x", is_deleted=False))
             step = "objective"
-            oid = (await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, title="x", deadline="2000-04-30", status="not_started", progress=0, sort_order=0, seq=1, is_deleted=False).returning(md["cos_objective"].c.id))).scalar()
+            oid = (await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, title="x", deadline="2000-04-30", status="not_started", progress=0, sort_order=0, is_deleted=False).returning(md["cos_objective"].c.id))).scalar()
             step = "sub-objective"
-            await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, parent_id=oid, title="y", seq=1, is_deleted=False))
+            await conn.execute(md["cos_objective"].insert().values(department_id=dep_id, fiscal_year=2000, quarter_number=1, parent_id=oid, title="y", is_deleted=False))
             step = "objective update"
             await conn.execute(md["cos_objective_update"].insert().values(objective_id=oid, user_id=current_user.id, text="x", is_deleted=False))
             step = "company widget"
@@ -1643,7 +1083,7 @@ async def self_check(db: AsyncSession = Depends(deps.get_db), current_user: User
             step = "task link"
             any_task = (await conn.execute(sa_text("SELECT id FROM task WHERE id NOT IN (SELECT task_id FROM cos_objective_task) LIMIT 1"))).scalar()
             if any_task:
-                await conn.execute(md["cos_objective_task"].insert().values(objective_id=oid, task_id=any_task, seq=2, is_deleted=False))
+                await conn.execute(md["cos_objective_task"].insert().values(objective_id=oid, task_id=any_task, is_deleted=False))
             report["write_test"] = {"ok": True}
         except Exception as e:
             report["write_test"] = {"ok": False, "failed_at": step, "error": f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"}
@@ -1754,61 +1194,18 @@ async def linkable_objectives(
         .filter(TargetDepartment.is_deleted == False).order_by(TargetDepartment.name)
     )).scalars().all() if can_see(current_user, d)]
     objs = await objectives_for(db, [d.id for d in depts], fy, q)
-    dept_map = {d.id: d for d in depts}
+    names = {d.id: d.name for d in depts}
     titles = {o.id: o.title for o in objs}
-    objs_by_id = {o.id: o for o in objs}
     tq = await task_quarter_id(db, fy, q)
-
-    # Count existing linked tasks per objective so we can compute next_task_code
-    obj_ids = [o.id for o in objs]
-    task_counts: Dict[int, int] = {}
-    if obj_ids:
-        link_rows = (await db.execute(
-            select(ObjectiveTask.objective_id)
-            .join(Task, Task.id == ObjectiveTask.task_id)
-            .filter(ObjectiveTask.objective_id.in_(obj_ids), ObjectiveTask.is_deleted == False, Task.is_deleted == False)
-        )).all()
-        for (oid,) in link_rows:
-            task_counts[oid] = task_counts.get(oid, 0) + 1
-
-    # codes come from the stored numbers; the next free number under an objective is its counter
-    code_map: Dict[int, str] = {o.id: cos_codes.objective_code(o, objs_by_id) for o in objs}
-    next_task_code_map: Dict[int, str] = {o.id: f"{code_map[o.id]}.{o.next_child_seq or 1}" for o in objs}
-    ordered_objs: List[DepartmentObjective] = []
-    for d in depts:
-        d_objs = [o for o in objs if o.department_id == d.id]
-        for r in sorted([o for o in d_objs if o.parent_id is None], key=lambda x: (x.seq or 0, x.id)):
-            ordered_objs.append(r)
-            ordered_objs.extend(sorted([o for o in d_objs if o.parent_id == r.id], key=lambda x: (x.seq or 0, x.id)))
-    dept_codes = {d.id: dept_short_code(d) for d in depts}
-
+    order = sorted(objs, key=lambda o: (names.get(o.department_id, ""), o.parent_id or o.id, o.parent_id is not None, o.sort_order or 0, o.id))
     return success_response(data={
         "quarter": quarter_info(fy, q),
         "objectives": [{
-            "id": o.id,
-            "code": code_map.get(o.id, ""),
-            "full_code": cos_codes.full(dept_codes.get(o.department_id), code_map.get(o.id, "")),
-            "next_task_code": next_task_code_map.get(o.id, ""),
-            "next_full_code": cos_codes.full(dept_codes.get(o.department_id), next_task_code_map.get(o.id, "")),
-            "priority": o.priority,
-            "deadline": o.deadline,
-            "tasks_count": task_counts.get(o.id, 0),
-            "title": o.title,
-            "level": "sub_objective" if o.parent_id else "objective",
-            "parent_id": o.parent_id,
+            "id": o.id, "title": o.title, "level": "sub_objective" if o.parent_id else "objective",
             "parent_title": titles.get(o.parent_id) if o.parent_id else None,
-            "project_id": o.project_id if o.project_id is not None else (objs_by_id[o.parent_id].project_id if o.parent_id and o.parent_id in objs_by_id else None),
-            "project_name": (
-                o.project.name if getattr(o, "project", None)
-                else (objs_by_id[o.parent_id].project.name if o.parent_id and o.parent_id in objs_by_id and getattr(objs_by_id[o.parent_id], "project", None) else None)
-            ),
-            "department": {
-                "id": o.department_id,
-                "name": dept_map[o.department_id].name if o.department_id in dept_map else None,
-                "short_code": dept_short_code(dept_map[o.department_id]) if o.department_id in dept_map else None,
-            },
+            "department": {"id": o.department_id, "name": names.get(o.department_id)},
             "task_quarter_id": tq,
-        } for o in ordered_objs],
+        } for o in order],
     }, message="Objectives fetched")
 
 
@@ -1818,123 +1215,34 @@ async def task_links(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    """Which objective each of these tasks belongs to (only objectives the caller may see),
-    including subtasks that inherit the objective link from an ancestor task and their hierarchical code."""
+    """Which objective each of these tasks belongs to (only objectives the caller may see)."""
     try:
         ids = [int(x) for x in task_ids.split(",") if x.strip()][:500]
     except ValueError:
         raise HTTPException(status_code=400, detail="task_ids must be a comma-separated list of numbers.")
     if not ids:
         return success_response(data={}, message="No tasks")
-
-    # Each task, its parent, grandparent ... (up to 6 hops), and which of them are linked to an objective
-    parent_of: Dict[int, Optional[int]] = {}
-    link_of: Dict[int, tuple] = {}  # task id -> (objective, link number)
-    frontier = list(ids)
-    for _ in range(6):
-        frontier = [t for t in frontier if t not in parent_of]
-        if not frontier:
-            break
-        for tid, pid in (await db.execute(select(Task.id, Task.parent_id).filter(Task.id.in_(frontier), Task.is_deleted == False))).all():
-            parent_of[tid] = pid
-        for tid, o, seq in (await db.execute(
-            select(ObjectiveTask.task_id, DepartmentObjective, ObjectiveTask.seq)
-            .join(DepartmentObjective, DepartmentObjective.id == ObjectiveTask.objective_id)
-            .filter(ObjectiveTask.task_id.in_(frontier), ObjectiveTask.is_deleted == False, DepartmentObjective.is_deleted == False)
-        )).all():
-            link_of[tid] = (o, seq)
-        frontier = [parent_of[t] for t in frontier if parent_of.get(t)]
-
-    # tid -> (objective, link number, inherited?, [task ids from the linked ancestor down to tid])
-    resolved: Dict[int, tuple] = {}
-    for tid in ids:
-        down, cur, anchor = [tid], tid, None
-        for _ in range(7):
-            if cur is None:
-                break
-            if cur in link_of:
-                par = parent_of.get(cur)
-                if par and par in link_of and link_of[par][0].id == link_of[cur][0].id:
-                    cur = par  # linked to the same objective as its parent: the page shows it as a subtask of that parent
-                    down.append(cur)
-                    continue
-                anchor = cur
-                break
-            cur = parent_of.get(cur)
-            if cur:
-                down.append(cur)
-        if anchor is not None:
-            resolved[tid] = (link_of[anchor][0], link_of[anchor][1], anchor != tid, list(reversed(down)))
-
-    if not resolved:
-        return success_response(data={}, message="Links fetched")
-
-    dept_ids = {o.department_id for o, *_ in resolved.values()}
+    rows = (await db.execute(
+        select(ObjectiveTask.task_id, DepartmentObjective)
+        .join(DepartmentObjective, DepartmentObjective.id == ObjectiveTask.objective_id)
+        .filter(ObjectiveTask.task_id.in_(ids), ObjectiveTask.is_deleted == False, DepartmentObjective.is_deleted == False)
+    )).all()
     depts = {d.id: d for d in (await db.execute(
         select(TargetDepartment).options(selectinload(TargetDepartment.members))
-        .filter(TargetDepartment.id.in_(dept_ids or {0}), TargetDepartment.is_deleted == False)
+        .filter(TargetDepartment.id.in_({o.department_id for _, o in rows} or {0}), TargetDepartment.is_deleted == False)
     )).scalars().all()}
-
-    # parents of sub-objectives (for the code and the inherited project), and the order of subtasks under each linked ancestor
-    objs_here = {o.id: o for o, *_ in resolved.values()}
-    parent_ids = {o.parent_id for o in objs_here.values() if o.parent_id}
-    parents: Dict[int, DepartmentObjective] = {}
-    if parent_ids:
-        parents = {p.id: p for p in (await db.execute(
-            select(DepartmentObjective).options(selectinload(DepartmentObjective.project)).filter(DepartmentObjective.id.in_(parent_ids))
-        )).scalars().all()}
-    own_projects = {o.id: o for o in (await db.execute(
-        select(DepartmentObjective).options(selectinload(DepartmentObjective.project)).filter(DepartmentObjective.id.in_(list(objs_here)))
-    )).scalars().all()}
-    holders = {chain[i] for _, _, _, chain in resolved.values() for i in range(len(chain) - 1)}
-    kids_of: Dict[int, List[int]] = {}
-    if holders:
-        for cid, pid in (await db.execute(
-            select(Task.id, Task.parent_id).filter(Task.parent_id.in_(holders), Task.is_deleted == False).order_by(Task.id)
-        )).all():
-            kids_of.setdefault(pid, []).append(cid)
-
     out = {}
-    for tid, (o, link_seq, inherited, chain) in resolved.items():
+    for tid, o in rows:
         d = depts.get(o.department_id)
-        if not (d and can_see(current_user, d)):
-            continue
-        o_full = own_projects.get(o.id, o)
-        par = parents.get(o.parent_id) if o.parent_id else None
-        proj_id = o_full.project_id if o_full.project_id is not None else (par.project_id if par else o.project_id)
-        proj = getattr(o_full, "project", None) or (getattr(par, "project", None) if par else None)
-        dcode = dept_short_code(d)
-        ocode = f"{par.seq}.{o.seq}" if par else str(o.seq)
-        tcode = f"{ocode}.{link_seq}"
-        for i in range(len(chain) - 1):
-            sibs = kids_of.get(chain[i], [])
-            child = chain[i + 1]
-            tcode += f".{sibs.index(child) + 1 if child in sibs else len(sibs) + 1}"
-        out[str(tid)] = {
-            "objective_id": o.id,
-            "objective_code": ocode,
-            "objective_full_code": cos_codes.full(dcode, ocode),
-            "task_code": tcode,
-            "project_code": cos_codes.full(dcode, tcode),
-            "full_code": cos_codes.full(dcode, tcode),
-            "is_subtask_inherited": inherited,
-            "title": o.title,
-            "description": o.description,
-            "deadline": o.deadline,
-            "progress": float(o.progress or 0.0),
-            "level": "sub_objective" if o.parent_id else "objective",
-            "priority": o.priority,
-            "project_id": proj_id,
-            "project_name": proj.name if proj else None,
-            "department": {"id": d.id, "name": d.name, "short_code": dcode},
-            "quarter": quarter_info(o.fiscal_year, o.quarter_number)["label"],
-        }
+        if d and can_see(current_user, d):
+            out[str(tid)] = {"objective_id": o.id, "title": o.title, "level": "sub_objective" if o.parent_id else "objective",
+                             "department": {"id": d.id, "name": d.name}, "quarter": quarter_info(o.fiscal_year, o.quarter_number)["label"]}
     return success_response(data=out, message="Links fetched")
 
 
 async def _task_or_404(db: AsyncSession, task_id: int):
     row = (await db.execute(
-        select(Task.id, Task.assigned_to_id, Task.assigned_by_id, Task.project_id, Task.deadline).filter(Task.id == task_id, Task.is_deleted == False)
+        select(Task.id, Task.assigned_to_id, Task.assigned_by_id).filter(Task.id == task_id, Task.is_deleted == False)
     )).first()
     if not row:
         raise HTTPException(status_code=404, detail="Task not found.")
@@ -1958,36 +1266,17 @@ async def link_task(
         raise HTTPException(status_code=403, detail="You can only link tasks you created or that are assigned to you.")
     # a task linked to a Q3 objective is a Q3 task in the Task Center too (only quarter_id is touched)
     tq = await task_quarter_id(db, o.fiscal_year, o.quarter_number, create=True)
-    parent_obj = await get_objective(db, o.parent_id) if o.parent_id else None
-    obj_project_id = o.project_id if o.project_id is not None else (parent_obj.project_id if parent_obj else None)
-    obj_deadline = o.deadline or (parent_obj.deadline if parent_obj else None)
-    update_vals: Dict[str, Any] = {}
     if tq:
-        update_vals["quarter_id"] = tq
-    if obj_project_id and task.project_id is None:
-        update_vals["project_id"] = obj_project_id
-    if obj_deadline and not task.deadline:
-        update_vals["deadline"] = obj_deadline
-        update_vals["original_deadline"] = obj_deadline
-    if update_vals:
-        await db.execute(sa_update(Task).where(Task.id == link_in.task_id).values(**update_vals))
+        await db.execute(sa_update(Task).where(Task.id == link_in.task_id).values(quarter_id=tq))
     existing = (await db.execute(select(ObjectiveTask).filter(ObjectiveTask.task_id == link_in.task_id))).scalars().first()
-    if existing and not existing.is_deleted and existing.objective_id == o.id:
-        pass  # already there: keep its number
-    elif existing:
-        # moved, or linked again after an unlink: it is a new item under this objective, so it gets a new number
+    if existing:
         existing.objective_id = o.id
         existing.is_deleted = False
         existing.linked_by_id = current_user.id
-        existing.seq = await cos_codes.next_child_seq(db, o.id)
     else:
-        db.add(ObjectiveTask(objective_id=o.id, task_id=link_in.task_id, linked_by_id=current_user.id, seq=await cos_codes.next_child_seq(db, o.id)))
+        db.add(ObjectiveTask(objective_id=o.id, task_id=link_in.task_id, linked_by_id=current_user.id))
     await db.commit()
-    info = await cos_codes.task_code_info(db, link_in.task_id)
-    return success_response(data={
-        "objective_id": o.id, "task_id": link_in.task_id,
-        "code": info["path"] if info else None, "full_code": info["full_code"] if info else None,
-    }, message="Task linked")
+    return success_response(data={"objective_id": o.id, "task_id": link_in.task_id}, message="Task linked")
 
 
 @router.delete("/tasks/{task_id}/link", response_model=APIResponse)
@@ -2054,22 +1343,14 @@ async def objectives_board(
     }
     out = []
     for d in depts:
-        planner = can_plan(current_user, d)
-        tree = build_tree(
-            [o for o in objs if o.department_id == d.id],
-            today,
-            tasks=linked,
-            dept_codes={d.id: dept_short_code(d)},
-            can_plan_dept=planner,
-            user_id=current_user.id,
-        )
+        tree = build_tree([o for o in objs if o.department_id == d.id], today, tasks=linked)
         t = targets.get(d.id)
         out.append({
             **dept_payload(d),
             "message": t.message if t else None,
             **summarize(tree),
             "objectives_tree": tree,
-            "can_plan": planner,
+            "can_plan": can_plan(current_user, d),
         })
     return success_response(data={
         "quarter": quarter_info(fy, q),

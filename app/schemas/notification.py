@@ -8,7 +8,6 @@ class NotificationBase(BaseModel):
     message: Optional[str] = None
     type: Optional[NotificationTypeEnum] = None
     is_read: Optional[bool] = False
-    link: Optional[str] = None
     user_id: Optional[int] = None
 
 class NotificationCreate(NotificationBase):
