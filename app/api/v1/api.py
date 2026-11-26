@@ -48,3 +48,7 @@ from app.api.v1.endpoints import product_features
 api_router.include_router(product_features.router, prefix="/product-features", tags=["product-features"])
 from app.api.v1.endpoints import my_meetings
 api_router.include_router(my_meetings.router, prefix="/my-meetings", tags=["my-meetings"])
+from app.api.v1.endpoints import timeline
+api_router.include_router(timeline.router, prefix="/timeline", tags=["timeline"])
+from app.api.v1.endpoints import priorities
+api_router.include_router(priorities.router, prefix="/priorities", tags=["priorities"])

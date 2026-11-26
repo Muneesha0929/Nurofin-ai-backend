@@ -9,7 +9,7 @@ called department_objective etc., so generic names are not safe in this database
 Fiscal quarters follow the Indian financial year: Q1 = Apr–Jun ... Q4 = Jan–Mar,
 and `fiscal_year` is the calendar year the FY starts in (FY 2026-27 -> 2026).
 """
-from sqlalchemy import Boolean, Column, Integer, String, Text, Float, ForeignKey, Table, DateTime, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Text, Float, ForeignKey, Table, DateTime, UniqueConstraint, Index, text
 from sqlalchemy.orm import relationship
 from app.db.base_class import Base
 
@@ -27,6 +27,7 @@ class TargetDepartment(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
+    short_code = Column(String, nullable=True)
     hod_id = Column(Integer, ForeignKey("user.id"), nullable=True)
     created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
 
@@ -63,6 +64,8 @@ class DepartmentQuarterTarget(Base):
     outcome_note = Column(Text, nullable=True)
     outcome_set_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
     outcome_set_at = Column(DateTime, nullable=True)
+    # Next free number for a top-level objective of this department + quarter. Only ever goes up.
+    next_objective_seq = Column(Integer, nullable=False, default=1, server_default=text("1"))
 
 
 class DepartmentObjective(Base):
@@ -80,10 +83,22 @@ class DepartmentObjective(Base):
     deadline = Column(String, nullable=True)  # YYYY-MM-DD, like the rest of the codebase
     status = Column(String, default="not_started")  # not_started | in_progress | done
     progress = Column(Float, default=0.0)
+    progress_manual = Column(Boolean, default=False)
+    project_id = Column(Integer, ForeignKey("project.id"), nullable=True, index=True)
     sort_order = Column(Integer, default=0)
     created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
+    # Stored code number: top level numbers within (department, FY, quarter), a sub-objective within its parent.
+    # Handed out once and never reused, so codes like PROD-1.2 keep pointing at the same item.
+    seq = Column(Integer, nullable=False)
+    # One shared counter for the numbers of this objective's sub-objectives and linked tasks.
+    next_child_seq = Column(Integer, nullable=False, default=1, server_default=text("1"))
+    # CEO-set priority: P1 | P2 | P3 | null (top-level and sub-objectives only)
+    priority = Column(String, nullable=True)
+    priority_set_at = Column(DateTime, nullable=True)
+    priority_set_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
 
     owner = relationship("User", foreign_keys=[owner_id])
+    project = relationship("Project", foreign_keys=[project_id])
 
 
 class DepartmentObjectiveUpdate(Base):
@@ -145,3 +160,35 @@ class ObjectiveTask(Base):
     objective_id = Column(Integer, ForeignKey("cos_objective.id"), nullable=False, index=True)
     task_id = Column(Integer, ForeignKey("task.id"), nullable=False)
     linked_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
+    # Stored code number within the objective (shared counter with its sub-objectives). Re-linking gets a new one.
+    seq = Column(Integer, nullable=False)
+
+
+class TimelineEntry(Base):
+    """One line on the timeline of a task or an objective: a deadline change (with the reason), an update, or a handover request.
+    Status changes, transfers and objective updates are read from their own tables when the timeline is shown."""
+    __tablename__ = "cos_timeline_entry"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entity = Column(String, nullable=False)      # task | objective
+    entity_id = Column(Integer, nullable=False)
+    kind = Column(String, nullable=False)        # date_change | update | handover
+    old_date = Column(String, nullable=True)     # YYYY-MM-DD
+    new_date = Column(String, nullable=True)
+    text = Column(Text, nullable=True)
+    person_id = Column(Integer, ForeignKey("user.id"), nullable=True)  # handover: who was asked to look after it
+    created_by_id = Column(Integer, ForeignKey("user.id"), nullable=True)
+
+    __table_args__ = (Index("ix_cos_timeline_entry_entity", "entity", "entity_id"),)
+
+
+class PrioritySeen(Base):
+    """The popup for a priority was shown to this user (and acknowledged) on `seen_on`."""
+    __tablename__ = "cos_priority_seen"
+    __table_args__ = (UniqueConstraint("user_id", "objective_id", name="uix_cos_priority_seen"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("user.id"), nullable=False, index=True)
+    objective_id = Column(Integer, ForeignKey("cos_objective.id"), nullable=False)
+    priority = Column(String, nullable=False)
+    seen_on = Column(String, nullable=False)  # YYYY-MM-DD

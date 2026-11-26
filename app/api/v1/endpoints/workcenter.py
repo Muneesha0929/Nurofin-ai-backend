@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel
 import json
 from app.models.task_comment import TaskComment
@@ -20,6 +20,8 @@ from app.models.task_history import TaskHistory
 from app.models.task_transfer import TaskTransfer, TransferStatusEnum
 from app.models.notification import Notification, NotificationTypeEnum
 from app.core.responses import success_response, error_response
+from app.services.cos_access import cos_today, require_task_edit, valid_date
+from app.services.cos_timeline import add_entry, clean_date, clean_reason, deadline_stats
 
 router = APIRouter()
 
@@ -105,7 +107,6 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
                     transfer_date = info.get('transfer_date')
                     transfer_to_name = info.get('transfer_to_name')
             else:
-                from app.models.task_history import TaskHistory
                 hist_res = await db.execute(
                     select(TaskHistory)
                     .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
@@ -123,11 +124,46 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         except Exception:
             pass
 
+    # Completion date change history (newest first)
+    date_history = []
+    prebuilt_dh = cache.get("date_history_lookup")
+    if prebuilt_dh is not None:
+        date_history = prebuilt_dh.get(t.id, [])
+    else:
+        dh_rows = (await db.execute(
+            select(TaskHistory)
+            .filter(
+                TaskHistory.task_id == t.id,
+                TaskHistory.action == "actual_completion_date_changed",
+                TaskHistory.is_deleted == False,
+            )
+            .order_by(TaskHistory.created_at.desc(), TaskHistory.id.desc())
+        )).scalars().all()
+        for h in dh_rows:
+            u = await get_user_cached(h.performed_by_id)
+            date_history.append({
+                "id": h.id,
+                "old_value": h.old_value,
+                "new_value": h.new_value,
+                "description": h.description,
+                "changed_by": u.full_name if u else None,
+                "changed_at": _iso_utc(h.created_at),
+            })
+
+    prebuilt_dl = cache.get("deadline_stats_lookup")
+    if prebuilt_dl is not None:
+        dl_stats = prebuilt_dl.get(t.id) or {}
+    else:
+        dl_stats = (await deadline_stats(db, "task", [t.id])).get(t.id) or {}
+    current_dl = (t.deadline or "")[:10] or None
+
     return {
         "id": t.id, "title": t.title, "description": t.description,
         "status": t.status.value if hasattr(t.status, 'value') else (t.status or "todo"),
         "priority": t.priority.value if hasattr(t.priority, 'value') else (t.priority or "medium"),
         "deadline": t.deadline, "start_date": t.start_date,
+        "original_deadline": (t.original_deadline or "")[:10] or dl_stats.get("original") or current_dl,
+        "deadline_changes": dl_stats.get("changes", 0),
         "estimated_hours": t.estimated_hours, "progress": t.progress or 0.0,
         "assigned_to_id": t.assigned_to_id,
         "assigned_to_name": assignee.full_name if assignee else None,
@@ -146,10 +182,12 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
         "transfer_date": transfer_date,
         "transfer_to_name": transfer_to_name,
         "actual_completion_date": t.actual_completion_date,
+        "completion_date_history": date_history,
         "extended_time": t.extended_time,
         "scheduled_date": t.scheduled_date,
         "scheduled_start_time": t.scheduled_start_time,
         "scheduled_end_time": t.scheduled_end_time,
+        "comments_count": (cache.get("comment_counts") or {}).get(t.id, 0),
     }
 
 
@@ -320,7 +358,6 @@ async def read_tasks(
     top_ids = [t.id for t in tasks if t.parent_id is None]
     if top_ids:
         try:
-            from app.models.task_history import TaskHistory
             rows = (await db.execute(
                 select(TaskHistory)
                 .where(
@@ -348,6 +385,62 @@ async def read_tasks(
             cache['history_lookup'] = lookup
         except Exception:
             cache['history_lookup'] = {}
+
+    if top_ids:
+        try:
+            cc_rows = (await db.execute(
+                select(TaskComment.task_id, func.count(TaskComment.id))
+                .where(TaskComment.task_id.in_(top_ids), TaskComment.is_deleted == False)
+                .group_by(TaskComment.task_id)
+            )).all()
+            cache['comment_counts'] = {tid: cnt for tid, cnt in cc_rows}
+        except Exception:
+            cache['comment_counts'] = {}
+
+    # Batch-load completion date change history across parent tasks & loaded subtasks
+    all_ids = list(top_ids)
+    def _collect_sub_ids(nodes, depth=0):
+        if depth >= 5:
+            return
+        for node in nodes or []:
+            try:
+                for st in node.subtasks or []:
+                    if not st.is_deleted:
+                        all_ids.append(st.id)
+                        _collect_sub_ids([st], depth + 1)
+            except Exception:
+                pass
+    _collect_sub_ids(tasks)
+    if all_ids:
+        try:
+            dh_rows = (await db.execute(
+                select(TaskHistory)
+                .where(
+                    TaskHistory.task_id.in_(all_ids),
+                    TaskHistory.action == "actual_completion_date_changed",
+                    TaskHistory.is_deleted == False,
+                )
+                .order_by(TaskHistory.created_at.desc(), TaskHistory.id.desc())
+            )).scalars().all()
+            uid_set = {h.performed_by_id for h in dh_rows if h.performed_by_id and h.performed_by_id not in cache['users']}
+            if uid_set:
+                for u in (await db.execute(select(User).filter(User.id.in_(uid_set)))).scalars().all():
+                    cache['users'][u.id] = u
+            dh_map: dict = {}
+            for h in dh_rows:
+                u = cache['users'].get(h.performed_by_id)
+                dh_map.setdefault(h.task_id, []).append({
+                    "id": h.id,
+                    "old_value": h.old_value,
+                    "new_value": h.new_value,
+                    "description": h.description,
+                    "changed_by": u.full_name if u else None,
+                    "changed_at": _iso_utc(h.created_at),
+                })
+            cache['date_history_lookup'] = dh_map
+        except Exception:
+            cache['date_history_lookup'] = {}
+        cache['deadline_stats_lookup'] = await deadline_stats(db, "task", all_ids)
 
     data = []
     for t in tasks:
@@ -493,7 +586,7 @@ async def create_task(
     actual_description = None if description == "" else description
     actual_estimated_hours = None if (estimated_hours is not None and estimated_hours < 0) else estimated_hours
     
-    # If subtask, inherit parent dates/quarter if not explicitly set
+    # If subtask, inherit parent start date/quarter/project if not explicitly set (the deadline is NOT inherited)
     parent = None
     if actual_parent_id:
         parent_r = await db.execute(select(Task).filter(Task.id == actual_parent_id))
@@ -501,8 +594,6 @@ async def create_task(
         if parent:
             if not actual_start_date:
                 actual_start_date = parent.start_date
-            if not actual_deadline:
-                actual_deadline = parent.deadline
             if not actual_project_id:
                 actual_project_id = parent.project_id
                 
@@ -586,6 +677,176 @@ async def _sync_task_status_to_issue(db: AsyncSession, task: Task, status: str):
         logging.getLogger(__name__).error(f"Failed to sync task status to issue: {e}")
 
 
+async def _would_create_cycle(db: AsyncSession, task_id: int, new_parent_id: Optional[int]) -> bool:
+    if not new_parent_id:
+        return False
+    if new_parent_id == task_id:
+        return True
+    cur = new_parent_id
+    seen = {task_id}
+    for _ in range(25):
+        if cur in seen:
+            return True
+        seen.add(cur)
+        r = await db.execute(select(Task.parent_id).filter(Task.id == cur, Task.is_deleted == False))
+        pid = r.scalar()
+        if not pid:
+            return False
+        cur = pid
+    return True
+
+
+@router.put("/bulk/parent")
+async def bulk_parent(
+    *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+    task_ids: List[int] = Query(...), parent_id: Optional[int] = Query(None),
+) -> Any:
+    """Move one or more existing tasks under a target parent task (or parent_id=0/None to make top-level)."""
+    target_parent_id = None if (parent_id is None or parent_id == 0) else parent_id
+    target_parent = None
+    if target_parent_id is not None:
+        pr = await db.execute(select(Task).filter(Task.id == target_parent_id, Task.is_deleted == False))
+        target_parent = pr.scalars().first()
+        if not target_parent:
+            return error_response(message="Target parent task not found")
+
+    r = await db.execute(select(Task).filter(Task.id.in_(task_ids), Task.is_deleted == False))
+    tasks_to_move = r.scalars().all()
+    # you must be allowed to change every task you move, and the task you move them under
+    await require_task_edit(db, current_user, list(tasks_to_move) + ([target_parent] if target_parent else []), "move these tasks")
+    affected_parents = set()
+    affected_projects = set()
+
+    for task in tasks_to_move:
+        if target_parent_id is not None and await _would_create_cycle(db, task.id, target_parent_id):
+            return error_response(message=f"Cannot move task '{task.title}' under itself or its own subtask")
+
+    for task in tasks_to_move:
+        old_parent_id = task.parent_id
+        if old_parent_id == target_parent_id:
+            continue
+        if old_parent_id:
+            affected_parents.add(old_parent_id)
+        if target_parent_id:
+            affected_parents.add(target_parent_id)
+        if task.project_id:
+            affected_projects.add(task.project_id)
+        if target_parent and target_parent.project_id and not task.project_id:
+            task.project_id = target_parent.project_id
+            affected_projects.add(target_parent.project_id)
+        if target_parent and target_parent.quarter_id and not task.quarter_id:
+            task.quarter_id = target_parent.quarter_id
+        task.parent_id = target_parent_id
+        await _add_history(
+            db, task.id, "parent_changed",
+            f"Moved under task #{target_parent_id}" if target_parent_id else "Detached to top-level task",
+            old_val=str(old_parent_id), new_val=str(target_parent_id), user_id=current_user.id,
+        )
+
+    await db.commit()
+    for p_id in affected_parents:
+        await _update_parent_task(db, p_id, current_user.id)
+        await _recalculate_parent_progress(db, p_id)
+    for proj_id in affected_projects:
+        await _recalculate_project_progress(db, proj_id)
+    await db.commit()
+    return success_response(message=f"Updated parent for {len(tasks_to_move)} tasks")
+
+
+# ─── DEADLINE CHANGES (with a reason) ─────────────────────────────────────────
+
+class DeadlineIn(BaseModel):
+    new_date: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class BulkDeadlineIn(BaseModel):
+    task_ids: List[int]
+    new_date: Optional[str] = None
+    shift_days: Optional[int] = None
+    reason: Optional[str] = None
+
+
+async def _apply_new_deadline(db: AsyncSession, task: Task, new_date: str, reason: str, user_id: int) -> None:
+    """Move the current deadline. The first deadline is kept as original_deadline; the reason goes on the timeline."""
+    old = (task.deadline or "")[:10] or None
+    if not task.original_deadline:
+        task.original_deadline = old or new_date
+    task.deadline = new_date
+    if not task.scheduled_date or (old and task.scheduled_date[:10] == old):
+        task.scheduled_date = new_date  # it was following the deadline
+    qid = await _determine_quarter_id(db, new_date)
+    if qid and qid != task.quarter_id:
+        task.quarter_id = qid
+        await db.execute(update(Task).where(Task.parent_id == task.id, Task.is_deleted == False).values(quarter_id=qid))
+    add_entry(db, "task", task.id, "date_change", user_id, old_date=old, new_date=new_date, text=reason)
+    await _add_history(db, task.id, "deadline_updated", f"Deadline: {old or 'Not set'} → {new_date} ({reason})", old_val=old, new_val=new_date, user_id=user_id)
+
+
+@router.post("/bulk/deadline")
+async def bulk_deadline(
+    *, body: BulkDeadlineIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Move the deadline of many tasks at once, to one date or by a number of days. All or nothing:
+    if you may not change one of them, none changes. Returns the old dates so the page can offer Undo."""
+    ids = list(dict.fromkeys(body.task_ids or []))
+    if not ids:
+        raise HTTPException(status_code=400, detail="Pick at least one task.")
+    if len(ids) > 500:
+        raise HTTPException(status_code=400, detail="Too many tasks at once (limit 500).")
+    if (body.new_date is None) == (body.shift_days is None):
+        raise HTTPException(status_code=400, detail="Give either a new date or a number of days to shift by, not both.")
+    if body.shift_days is not None and abs(body.shift_days) > 3650:
+        raise HTTPException(status_code=400, detail="That is too many days to shift.")
+    tasks = (await db.execute(select(Task).filter(Task.id.in_(ids), Task.is_deleted == False))).scalars().all()
+    missing = sorted(set(ids) - {t.id for t in tasks})
+    if missing:
+        raise HTTPException(status_code=404, detail="These tasks were not found: " + ", ".join(str(i) for i in missing) + ". Nothing was changed.")
+    await require_task_edit(db, current_user, list(tasks), "change this deadline", list_ids=True)
+    reason = clean_reason(body.reason)
+    fixed = clean_date(body.new_date) if body.new_date is not None else None
+    today = cos_today()
+    updated, previous = [], {}
+    for t in sorted(tasks, key=lambda x: x.id):
+        old = (t.deadline or "")[:10] or None
+        if fixed:
+            new = fixed
+        else:
+            base = datetime.strptime(old, "%Y-%m-%d").date() if valid_date(old) else today
+            new = (base + timedelta(days=body.shift_days)).isoformat()
+        if new == old:
+            continue
+        previous[str(t.id)] = old
+        await _apply_new_deadline(db, t, new, reason, current_user.id)
+        updated.append(t.id)
+    await db.commit()
+    for pid in {t.project_id for t in tasks if t.id in updated and t.project_id}:
+        await _recalculate_project_progress(db, pid)
+    return success_response(data={"updated": updated, "previous": previous}, message=f"Deadline changed for {len(updated)} task(s)")
+
+
+@router.post("/{task_id}/deadline")
+async def extend_deadline(
+    *, task_id: int, body: DeadlineIn, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Move one task's deadline. A reason is required and shown on its timeline.
+    Allowed for the assignee, the person who created the task, the HOD of a linked department and the Director."""
+    task = (await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id, Task.is_deleted == False))).scalars().first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found.")
+    await require_task_edit(db, current_user, [task], "change this deadline")
+    new_date = clean_date(body.new_date)
+    reason = clean_reason(body.reason)
+    if (task.deadline or "")[:10] == new_date:
+        raise HTTPException(status_code=400, detail="That is already the deadline.")
+    await _apply_new_deadline(db, task, new_date, reason, current_user.id)
+    await db.commit()
+    if task.project_id:
+        await _recalculate_project_progress(db, task.project_id)
+    task = (await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))).scalars().first()
+    return success_response(data=await _serialize_task(db, task), message="Deadline changed")
+
+
 @router.put("/{task_id}")
 async def update_task(
     *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
@@ -593,7 +854,7 @@ async def update_task(
     priority: str = None, deadline: str = None, start_date: str = None,
     estimated_hours: float = None, assigned_to_id: int = None,
     reviewer_id: int = None, progress: float = None,
-    project_id: int = None, quarter_id: int = None,
+    project_id: int = None, quarter_id: int = None, parent_id: int = None,
     actual_completion_date: str = None, extended_time: float = None,
     scheduled_date: str = None, scheduled_start_time: str = None, scheduled_end_time: str = None,
 ) -> Any:
@@ -602,7 +863,25 @@ async def update_task(
     if not task:
         return error_response(message="Task not found")
         
+    # The deadline can be set once here. Moving it later needs a reason: POST /workcenter/{id}/deadline
+    if deadline is not None:
+        wanted = (deadline or "").strip()[:10]
+        current = (task.deadline or "")[:10]
+        if current and wanted != current:
+            raise HTTPException(status_code=400, detail="Use Extend deadline and give a reason.")
+    # Moving a task under another one: you must be allowed to change both
+    if parent_id is not None:
+        wanted_parent = None if parent_id == 0 else parent_id
+        if wanted_parent != task.parent_id:
+            to_check = [task]
+            if wanted_parent is not None:
+                np_row = (await db.execute(select(Task).filter(Task.id == wanted_parent, Task.is_deleted == False))).scalars().first()
+                if np_row:
+                    to_check.append(np_row)
+            await require_task_edit(db, current_user, to_check, "move this task")
+
     old_project_id = task.project_id
+    old_parent_id = task.parent_id
     
     if title is not None:
         task.title = title
@@ -615,12 +894,16 @@ async def update_task(
         await _sync_task_status_to_issue(db, task, status)
     if priority is not None:
         task.priority = priority
-    if deadline is not None:
-        old_dl = task.deadline
-        task.deadline = deadline if deadline != "" else None
-        if scheduled_date is None:
-            task.scheduled_date = task.deadline
-        await _add_history(db, task_id, "deadline_updated", f"Deadline: {old_dl} → {deadline}", old_val=old_dl, new_val=deadline, user_id=current_user.id)
+    # first-time deadline (changing an existing one was refused above)
+    if deadline is not None and not task.deadline:
+        new_dl = deadline if deadline != "" else None
+        if new_dl:
+            task.deadline = new_dl
+            if not task.original_deadline:
+                task.original_deadline = new_dl[:10]
+            if scheduled_date is None:
+                task.scheduled_date = task.deadline
+            await _add_history(db, task_id, "deadline_updated", f"Target Date set: {new_dl}", old_val=None, new_val=new_dl, user_id=current_user.id)
     if scheduled_date is not None:
         task.scheduled_date = scheduled_date if scheduled_date != "" else None
     if scheduled_start_time is not None:
@@ -628,7 +911,19 @@ async def update_task(
     if scheduled_end_time is not None:
         task.scheduled_end_time = scheduled_end_time if scheduled_end_time != "" else None
     if actual_completion_date is not None:
-        task.actual_completion_date = actual_completion_date if actual_completion_date != "" else None
+        old_acd = task.actual_completion_date
+        new_acd = actual_completion_date if actual_completion_date != "" else None
+        if new_acd != old_acd:
+            task.actual_completion_date = new_acd
+            await _add_history(
+                db,
+                task_id,
+                "actual_completion_date_changed",
+                f"Actual Completion Date: {old_acd or 'Not set'} → {new_acd or 'Cleared'}",
+                old_val=old_acd,
+                new_val=new_acd,
+                user_id=current_user.id,
+            )
     if extended_time is not None:
         task.extended_time = extended_time
         # Propagate deadline to subtasks
@@ -680,12 +975,35 @@ async def update_task(
         
     if quarter_id is not None:
         task.quarter_id = None if quarter_id == 0 else quarter_id
-        
+
+    if parent_id is not None:
+        new_parent_id = None if parent_id == 0 else parent_id
+        if new_parent_id != task.parent_id:
+            if new_parent_id is not None:
+                if await _would_create_cycle(db, task_id, new_parent_id):
+                    return error_response(message="Cannot move task under itself or one of its subtasks")
+                pr = await db.execute(select(Task).filter(Task.id == new_parent_id, Task.is_deleted == False))
+                new_parent = pr.scalars().first()
+                if not new_parent:
+                    return error_response(message="Target parent task not found")
+                if not task.project_id and new_parent.project_id:
+                    task.project_id = new_parent.project_id
+                if not task.quarter_id and new_parent.quarter_id:
+                    task.quarter_id = new_parent.quarter_id
+            task.parent_id = new_parent_id
+            await _add_history(
+                db, task_id, "parent_changed",
+                f"Moved under task #{new_parent_id}" if new_parent_id else "Detached to top-level task",
+                old_val=str(old_parent_id), new_val=str(new_parent_id), user_id=current_user.id,
+            )
+
     if progress is not None:
         task.progress = progress
         
     if task.parent_id:
         await _update_parent_task(db, task.parent_id, current_user.id)
+    if old_parent_id and old_parent_id != task.parent_id:
+        await _update_parent_task(db, old_parent_id, current_user.id)
 
     # Notify users mentioned in description if description was updated
     if description is not None and description.strip():
@@ -709,6 +1027,8 @@ async def update_task(
         
     if task.parent_id:
         await _recalculate_parent_progress(db, task.parent_id)
+    if old_parent_id and old_parent_id != task.parent_id:
+        await _recalculate_parent_progress(db, old_parent_id)
         
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))
     task = r.scalars().first()
@@ -747,6 +1067,35 @@ async def get_task(
     return success_response(data=await _serialize_task(db, task))
 
 
+@router.put("/bulk/status")
+async def bulk_status(
+    *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
+    task_ids: List[int] = Query(...), status: str,
+) -> Any:
+    """Set the status of many tasks. Defined before /{task_id}/status so that "bulk" is not read as a task id."""
+    r = await db.execute(select(Task).filter(Task.id.in_(task_ids), Task.is_deleted == False))
+    tasks = r.scalars().all()
+    await require_task_edit(db, current_user, list(tasks), "change this status")
+    parent_ids = set()
+    project_ids = set()
+    for task in tasks:
+        old = task.status.value if task.status else None
+        task.status = status
+        await _add_history(db, task.id, "status_changed", f"Status: {old} → {status}", old_val=old, new_val=status, user_id=current_user.id)
+        if task.parent_id:
+            parent_ids.add(task.parent_id)
+        if task.project_id:
+            project_ids.add(task.project_id)
+    for p_id in parent_ids:
+        await _update_parent_task(db, p_id, current_user.id)
+    await db.commit()
+    for p_id in project_ids:
+        await _recalculate_project_progress(db, p_id)
+    for p_id in parent_ids:
+        await _recalculate_parent_progress(db, p_id)
+    return success_response(message=f"Updated {len(tasks)} tasks")
+
+
 @router.put("/{task_id}/status")
 async def update_status(
     *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
@@ -770,32 +1119,6 @@ async def update_status(
     if task.parent_id:
         await _recalculate_parent_progress(db, task.parent_id)
     return success_response(data={"status": status})
-
-
-@router.put("/bulk/status")
-async def bulk_status(
-    *, db: AsyncSession = Depends(deps.get_db), current_user: User = Depends(deps.get_current_user),
-    task_ids: List[int], status: str,
-) -> Any:
-    r = await db.execute(select(Task).filter(Task.id.in_(task_ids), Task.is_deleted == False))
-    parent_ids = set()
-    project_ids = set()
-    for task in r.scalars().all():
-        old = task.status.value if task.status else None
-        task.status = status
-        await _add_history(db, task.id, "status_changed", f"Status: {old} → {status}", old_val=old, new_val=status, user_id=current_user.id)
-        if task.parent_id:
-            parent_ids.add(task.parent_id)
-        if task.project_id:
-            project_ids.add(task.project_id)
-    for p_id in parent_ids:
-        await _update_parent_task(db, p_id, current_user.id)
-    await db.commit()
-    for p_id in project_ids:
-        await _recalculate_project_progress(db, p_id)
-    for p_id in parent_ids:
-        await _recalculate_parent_progress(db, p_id)
-    return success_response(message=f"Updated {len(task_ids)} tasks")
 
 
 # ─── HISTORY / TRANSFERS ──────────────────────────────────────────────────────
@@ -836,6 +1159,12 @@ async def transfer_task(
     db.add(transfer)
     task.assigned_to_id = to_user_id
     if new_deadline:
+        new_day = new_deadline[:10]
+        old_day = (task.deadline or "")[:10] or None
+        if not task.original_deadline:
+            task.original_deadline = old_day or new_day
+        if old_day != new_day:
+            add_entry(db, "task", task.id, "date_change", current_user.id, old_date=old_day, new_date=new_day, text=f"Transferred: {reason}")
         task.deadline = new_deadline
     await _add_history(db, task_id, "transferred", f"Transferred from {from_id} to {to_user_id}",
                        old_val=str(from_id), new_val=str(to_user_id), user_id=current_user.id)

@@ -1,17 +1,19 @@
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
 
 class DepartmentCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
+    short_code: Optional[str] = Field(None, max_length=12)
     hod_id: Optional[int] = None
     member_ids: List[int] = Field(default_factory=list, max_length=500)
 
 
 class DepartmentUpdate(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=120)
+    short_code: Optional[str] = Field(None, max_length=12)
     hod_id: Optional[int] = None
     member_ids: Optional[List[int]] = Field(None, max_length=500)
 
@@ -34,6 +36,7 @@ class ObjectiveCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=300)
     description: Optional[str] = Field(None, max_length=5000)
     owner_id: Optional[int] = None
+    project_id: Optional[int] = None
     deadline: Optional[str] = Field(None, pattern=DATE_PATTERN)
 
 
@@ -41,9 +44,21 @@ class ObjectiveUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=300)
     description: Optional[str] = Field(None, max_length=5000)
     owner_id: Optional[int] = None
+    project_id: Optional[int] = None
     deadline: Optional[str] = Field(None, pattern=DATE_PATTERN)
     status: Optional[Literal["not_started", "in_progress", "done"]] = None
     progress: Optional[float] = Field(None, ge=0, le=100)
+    priority: Optional[Literal["P1", "P2", "P3"]] = None  # CEO only; null clears it
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _upper_priority(cls, v):
+        return v.strip().upper() if isinstance(v, str) and v.strip() else (None if isinstance(v, str) else v)
+
+
+class DeadlineChange(BaseModel):
+    new_date: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class ObjectiveUpdatePost(BaseModel):
