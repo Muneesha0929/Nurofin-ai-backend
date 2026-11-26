@@ -1,5 +1,5 @@
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
@@ -48,6 +48,17 @@ class ObjectiveUpdate(BaseModel):
     deadline: Optional[str] = Field(None, pattern=DATE_PATTERN)
     status: Optional[Literal["not_started", "in_progress", "done"]] = None
     progress: Optional[float] = Field(None, ge=0, le=100)
+    priority: Optional[Literal["P1", "P2", "P3"]] = None  # CEO only; null clears it
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def _upper_priority(cls, v):
+        return v.strip().upper() if isinstance(v, str) and v.strip() else (None if isinstance(v, str) else v)
+
+
+class DeadlineChange(BaseModel):
+    new_date: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class ObjectiveUpdatePost(BaseModel):
