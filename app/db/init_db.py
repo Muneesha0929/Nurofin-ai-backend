@@ -2,6 +2,7 @@ import asyncio
 from sqlalchemy.future import select
 from sqlalchemy import text
 from app.db.base_class import Base
+from app.db.cos_schema import ensure_cos_schema, ensure_notification_priority
 from app.db.session import SessionLocal, engine
 
 # Import all models to ensure they are registered with Base.metadata
@@ -153,6 +154,21 @@ async def init_db() -> None:
     except Exception as e:
         print(f"Database Initialization: Error verifying/creating tables: {e}")
         return
+
+    # Chief of Staff codes / timeline / priorities columns. Production's alembic history is broken,
+    # so new columns have to be added here (create_all never alters existing tables).
+    try:
+        async with engine.connect() as conn:
+            ac = await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await ac.run_sync(ensure_notification_priority)
+    except Exception as e:
+        print(f"Database Initialization: notification type 'priority' not added: {e}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(ensure_cos_schema)
+        print("Database Initialization: Chief of Staff schema verified.")
+    except Exception as e:
+        print(f"Database Initialization: CHIEF OF STAFF SCHEMA SYNC FAILED: {e}")
 
     async with SessionLocal() as db:
         try:
