@@ -15,6 +15,7 @@ from app.models.user import User
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.issue import IssueCreate, IssueUpdate, IssueFollowupCreate
 from app.core.responses import APIResponse, success_response, error_response
+from app.core.live_events import publish_live_event
 from app.services.issue_assignment import auto_assign_fields
 from app.services.issue_external import build_track_member_clause, can_view_issue, external_brief
 from app.services.issue_callbacks import schedule_status_callback
@@ -32,7 +33,7 @@ def _is_admin(user: Optional[User]) -> bool:
     if not user:
         return False
     role = _role(user).lower()
-    return role in CEO_ROLES or user.id in (1, 3) or getattr(user, "is_superuser", False)
+    return role in CEO_ROLES or user.id == 1 or getattr(user, "is_superuser", False)
 
 
 def _fmt_date(d) -> Optional[str]:
@@ -122,6 +123,8 @@ async def read_issues(
     reported_by_id: Optional[int] = None,
     mine: Optional[bool] = None,
     search: Optional[str] = None,
+    include_resolved: bool = False,
+    include_deleted_users: bool = False,
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(deps.get_current_user),
@@ -144,8 +147,18 @@ async def read_issues(
             )
         )
 
+    # Hide issues belonging to deleted / former employees by default
+    if not include_deleted_users:
+        q = q.filter(
+            ~Issue.reported_by.has(User.is_deleted == True),
+            ~Issue.assigned_user.has(User.is_deleted == True),
+        )
+
     if status:
         q = q.filter(Issue.status == status)
+    elif not include_resolved:
+        q = q.filter(Issue.status.notin_([IssueStatusEnum.resolved, IssueStatusEnum.closed]))
+
     if priority:
         q = q.filter(Issue.priority == priority)
     if project_id:
@@ -172,6 +185,15 @@ async def read_issues(
                 build_track_member_clause(current_user.id),
             )
         )
+    if not include_deleted_users:
+        count_q = count_q.filter(
+            ~Issue.reported_by.has(User.is_deleted == True),
+            ~Issue.assigned_user.has(User.is_deleted == True),
+        )
+    if status:
+        count_q = count_q.filter(Issue.status == status)
+    elif not include_resolved:
+        count_q = count_q.filter(Issue.status.notin_([IssueStatusEnum.resolved, IssueStatusEnum.closed]))
     total = (await db.execute(count_q)).scalar() or 0
 
     return success_response(data={"issues": data, "total": total}, message="Issues fetched successfully")

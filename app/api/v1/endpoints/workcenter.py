@@ -20,6 +20,8 @@ from app.models.task_history import TaskHistory
 from app.models.task_transfer import TaskTransfer, TransferStatusEnum
 from app.models.notification import Notification, NotificationTypeEnum
 from app.core.responses import success_response, error_response
+from app.core.scheduling import find_next_free_slot
+from app.core.live_events import publish_live_event
 
 router = APIRouter()
 
@@ -595,8 +597,14 @@ async def create_task(
         actual_quarter_id = parent.quarter_id
 
     actual_scheduled_date = (None if scheduled_date == "" else scheduled_date) or actual_deadline
-    actual_scheduled_start = (None if scheduled_start_time == "" else scheduled_start_time) or "09:00"
-    actual_scheduled_end = (None if scheduled_end_time == "" else scheduled_end_time) or "10:00"
+    if scheduled_start_time and scheduled_start_time != "":
+        actual_scheduled_start = scheduled_start_time
+        actual_scheduled_end = (None if scheduled_end_time == "" else scheduled_end_time) or "10:00"
+    else:
+        slot_date = actual_scheduled_date or datetime.utcnow().strftime("%Y-%m-%d")
+        actual_scheduled_start, actual_scheduled_end = await find_next_free_slot(
+            db, actual_assigned_to_id, slot_date
+        )
 
     task = Task(title=title, description=actual_description, priority=priority,
                 project_id=actual_project_id, quarter_id=actual_quarter_id, assigned_to_id=actual_assigned_to_id,
@@ -632,6 +640,7 @@ async def create_task(
         await _recalculate_parent_progress(db, task.parent_id)
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task.id))
     task = r.scalars().first()
+    await publish_live_event("task_updated", {"task_id": task.id, "actor_id": current_user.id})
     return success_response(data=await _serialize_task(db, task))
 
 
@@ -773,14 +782,14 @@ async def update_task(
         await _sync_task_status_to_issue(db, task, status)
     if priority is not None:
         task.priority = priority
-    # Target Date (deadline) is fixed from the beginning once set
-    if deadline is not None and not task.deadline:
+    if deadline is not None:
         new_dl = deadline if deadline != "" else None
-        if new_dl:
+        if new_dl != task.deadline:
+            old_dl = task.deadline
             task.deadline = new_dl
-            if scheduled_date is None:
-                task.scheduled_date = task.deadline
-            await _add_history(db, task_id, "deadline_updated", f"Target Date set: {new_dl}", old_val=None, new_val=new_dl, user_id=current_user.id)
+            if scheduled_date is None and new_dl:
+                task.scheduled_date = new_dl
+            await _add_history(db, task_id, "deadline_updated", f"Target Date: {old_dl or 'Not set'} → {new_dl or 'Cleared'}", old_val=old_dl, new_val=new_dl, user_id=current_user.id)
     if scheduled_date is not None:
         task.scheduled_date = scheduled_date if scheduled_date != "" else None
     if scheduled_start_time is not None:
@@ -909,6 +918,7 @@ async def update_task(
         
     r = await db.execute(select(Task).options(selectinload(Task.subtasks)).filter(Task.id == task_id))
     task = r.scalars().first()
+    await publish_live_event("task_updated", {"task_id": task.id, "actor_id": current_user.id})
     return success_response(data=await _serialize_task(db, task))
 
 
@@ -966,6 +976,7 @@ async def update_status(
     await _recalculate_project_progress(db, task.project_id)
     if task.parent_id:
         await _recalculate_parent_progress(db, task.parent_id)
+    await publish_live_event("task_updated", {"task_id": task.id, "status": status, "actor_id": current_user.id})
     return success_response(data={"status": status})
 
 
@@ -1340,6 +1351,7 @@ async def create_task_comment(
 
     await db.commit()
     await db.refresh(comment)
+    await publish_live_event("comment_added", {"task_id": task.id, "comment_id": comment.id, "actor_id": current_user.id})
 
     return success_response(
         data={
@@ -1446,6 +1458,7 @@ async def update_task_comment(
 
     await db.commit()
     await db.refresh(comment)
+    await publish_live_event("comment_updated", {"task_id": task.id, "comment_id": comment.id, "actor_id": current_user.id})
 
     comm_user = await _get_user(db, comment.user_id)
 
