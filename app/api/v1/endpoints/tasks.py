@@ -11,6 +11,8 @@ from app.models.user import User
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.task import TaskCreate, TaskUpdate, Task as TaskSchema
 from app.core.responses import APIResponse, success_response, error_response
+from app.core.scheduling import find_next_free_slot
+from app.core.live_events import publish_live_event
 from app.services.knowledge_indexer import KnowledgeIndexer
 
 router = APIRouter()
@@ -237,6 +239,13 @@ async def create_task(
                 
         if not task_data.get("assigned_to_id"):
             task_data["assigned_to_id"] = current_user.id
+        if not task_data.get("scheduled_start_time"):
+            from datetime import datetime as _dt
+            slot_date = task_data.get("scheduled_date") or date_str or _dt.utcnow().strftime("%Y-%m-%d")
+            st, et = await find_next_free_slot(db, task_data.get("assigned_to_id"), str(slot_date)[:10])
+            task_data["scheduled_start_time"] = st
+            if not task_data.get("scheduled_end_time"):
+                task_data["scheduled_end_time"] = et
         db_task = Task(**task_data, assigned_by_id=current_user.id, quarter_id=quarter_id)
         db.add(db_task)
         await db.flush()
@@ -268,7 +277,8 @@ async def create_task(
         # Reload with relationships
         res = await db.execute(select(Task).options(selectinload(Task.assigned_to), selectinload(Task.assigned_by)).filter(Task.id == db_task.id))
         db_task_loaded = res.scalars().first()
-        
+        await publish_live_event("task_updated", {"task_id": db_task.id, "actor_id": current_user.id})
+
         return success_response(
             data=TaskSchema.from_orm(db_task_loaded).dict(),
             message="Task created successfully"

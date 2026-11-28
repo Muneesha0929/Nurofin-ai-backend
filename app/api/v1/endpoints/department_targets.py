@@ -23,6 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api import deps
 from app.core.responses import APIResponse, success_response
+from app.core.live_events import publish_live_event
 from app.models.department_target import (
     CompanyQuarterGoal,
     CompanyWidget,
@@ -195,6 +196,7 @@ def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
 def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[List[int]] = None,
                tasks: Optional[Dict[int, List[Dict[str, Any]]]] = None,
                dept_codes: Optional[Dict[int, str]] = None,
+               updates: Optional[Dict[int, List[Dict[str, Any]]]] = None,
                can_plan_dept: Optional[bool] = None,
                user_id: Optional[int] = None) -> List[Dict[str, Any]]:
     """Objectives with their sub-objectives and linked Task Center tasks.
@@ -202,6 +204,7 @@ def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[L
     Codes come from the stored numbers (cos_codes), `full_code` adds the department prefix when dept_codes is given."""
     tasks = tasks or {}
     dept_codes = dept_codes or {}
+    updates = updates or {}
     obj_by_id: Dict[int, DepartmentObjective] = {o.id: o for o in objs}
     children: Dict[Optional[int], List[DepartmentObjective]] = {}
     for o in objs:
@@ -264,6 +267,8 @@ def build_tree(objs: List[DepartmentObjective], today: str, root_ids: Optional[L
             "can_update_progress": can_update_pct,
             "overdue": bool(o.deadline and o.deadline < today and not done),
             "tasks": linked,
+            "updates": updates.get(o.id, []),
+            "update_count": len(updates.get(o.id, [])),
             "children": kids,
         }
 
@@ -362,6 +367,31 @@ async def objectives_for(db: AsyncSession, dept_ids: List[int], fy: int, q: Opti
 
 def _status(v) -> str:
     return str(v.value if hasattr(v, "value") else (v or "todo"))
+
+
+async def updates_for(db: AsyncSession, objective_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """Batch-load updates / follow-ups posted on objectives and sub-objectives."""
+    if not objective_ids:
+        return {}
+    rows = (await db.execute(
+        select(DepartmentObjectiveUpdate)
+        .options(selectinload(DepartmentObjectiveUpdate.user))
+        .filter(
+            DepartmentObjectiveUpdate.objective_id.in_(objective_ids),
+            DepartmentObjectiveUpdate.is_deleted == False,
+        )
+        .order_by(DepartmentObjectiveUpdate.created_at.desc(), DepartmentObjectiveUpdate.id.desc())
+    )).scalars().all()
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    for u in rows:
+        out.setdefault(u.objective_id, []).append({
+            "id": u.id,
+            "objective_id": u.objective_id,
+            "user": user_brief(u.user),
+            "text": u.text,
+            "created_at": _iso_utc(u.created_at),
+        })
+    return out
 
 
 async def tasks_for(db: AsyncSession, objective_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
@@ -510,6 +540,9 @@ async def tasks_for(db: AsyncSession, objective_ids: List[int]) -> Dict[int, Lis
             "original_deadline": (t.original_deadline or "")[:10] or (task_stats.get(t.id) or {}).get("original") or dl,
             "deadline_changes": (task_stats.get(t.id) or {}).get("changes", 0),
             "seq": link_seq.get(t.id),
+            "scheduled_date": (t.scheduled_date or "")[:10] or dl,
+            "scheduled_start_time": t.scheduled_start_time,
+            "scheduled_end_time": t.scheduled_end_time,
             "progress": float(t.progress or 0.0),
             "overdue": bool(dl and dl < today and not done),
             "project_id": t.project_id,
@@ -603,7 +636,9 @@ async def overview(
     } if ids else {}
 
     objs = await objectives_for(db, ids, fy, q)
-    linked_tasks = await tasks_for(db, [o.id for o in objs])
+    obj_ids = [o.id for o in objs]
+    linked_tasks = await tasks_for(db, obj_ids)
+    obj_updates = await updates_for(db, obj_ids)
     by_dept: Dict[int, List[DepartmentObjective]] = {}
     for o in objs:
         by_dept.setdefault(o.department_id, []).append(o)
@@ -613,7 +648,7 @@ async def overview(
     progress_values = []
     for d in depts:
         t = targets.get(d.id)
-        tree = build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks, dept_codes=dept_codes)
+        tree = build_tree(by_dept.get(d.id, []), today, tasks=linked_tasks, dept_codes=dept_codes, updates=obj_updates)
         stats = summarize(tree)
         for k in totals:
             totals[k] += stats[k]
@@ -805,7 +840,9 @@ async def department_detail(
         )).scalars().all()
     }
     objs = await objectives_for(db, [dept_id], fy)
-    linked_tasks = await tasks_for(db, [o.id for o in objs])
+    obj_ids = [o.id for o in objs]
+    linked_tasks = await tasks_for(db, obj_ids)
+    obj_updates = await updates_for(db, obj_ids)
     is_hod = dept.hod_id == current_user.id
     planner = can_plan(current_user, dept)
 
@@ -817,6 +854,7 @@ async def department_detail(
             today,
             tasks=linked_tasks,
             dept_codes={dept.id: dept_short_code(dept)},
+            updates=obj_updates,
             can_plan_dept=planner,
             user_id=current_user.id,
         )
@@ -1224,7 +1262,7 @@ async def objective_detail(
         "director_message": target.message if target else None,
         "parent": {"id": parent.id, "title": parent.title, "code": code_map.get(parent.id), "full_code": cos_codes.full(dcode, code_map.get(parent.id)), "project_id": parent.project_id} if parent else None,
         "updates": [
-            {"id": u.id, "user": user_brief(u.user), "text": u.text, "created_at": u.created_at.isoformat() if u.created_at else None}
+            {"id": u.id, "user": user_brief(u.user), "text": u.text, "created_at": _iso_utc(u.created_at)}
             for u in updates
         ],
         "permissions": {
@@ -1262,6 +1300,7 @@ async def post_objective_update(
             link=f"/departments?id={dept.id}",
         ))
     await db.commit()
+    await publish_live_event("objective_updated", {"objective_id": o.id, "department_id": dept.id, "actor_id": current_user.id})
     return success_response(data={"id": u.id}, message="Update posted")
 
 

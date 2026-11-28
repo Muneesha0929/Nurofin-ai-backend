@@ -52,3 +52,5 @@ from app.api.v1.endpoints import timeline
 api_router.include_router(timeline.router, prefix="/timeline", tags=["timeline"])
 from app.api.v1.endpoints import priorities
 api_router.include_router(priorities.router, prefix="/priorities", tags=["priorities"])
+from app.api.v1.endpoints import events
+api_router.include_router(events.router, prefix="/events", tags=["events"])
