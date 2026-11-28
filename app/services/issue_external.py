@@ -31,7 +31,7 @@ def _is_admin(user: Optional[User]) -> bool:
     if not user:
         return False
     r = _role(user).lower()
-    return r in PRIVILEGED_ROLES or user.id in (1, 3) or getattr(user, "is_superuser", False)
+    return r in PRIVILEGED_ROLES or user.id == 1 or getattr(user, "is_superuser", False)
 
 
 def build_track_member_clause(user_id: int):

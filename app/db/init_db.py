@@ -1,12 +1,16 @@
 import asyncio
+from datetime import date
 from sqlalchemy.future import select
-from sqlalchemy import text
+from sqlalchemy import text, or_
 from app.db.base_class import Base
 from app.db.cos_schema import ensure_cos_schema, ensure_notification_priority
 from app.db.session import SessionLocal, engine
 
 # Import all models to ensure they are registered with Base.metadata
 from app.models import User, Department, Role
+from app.models.deleted_user import DeletedUser
+from app.models.issue import Issue, IssueStatusEnum
+from app.models.task import Task, TaskStatusEnum
 from app.core.security import get_password_hash
 
 # Predefined departments and their roles (matching reset_and_seed.py)
@@ -229,4 +233,49 @@ async def init_db() -> None:
                 print("Database Initialization: CEO user already exists. Seeding skipped.")
         except Exception as e:
             print(f"Database Initialization: Error seeding database: {e}")
+            await db.rollback()
+
+        try:
+            former_ids_res = await db.execute(
+                select(User.id).filter(or_(User.is_deleted == True, User.is_active == False))
+            )
+            former_ids = {r[0] for r in former_ids_res.all()}
+            del_ids_res = await db.execute(select(DeletedUser.original_user_id))
+            former_ids.update(r[0] for r in del_ids_res.all())
+
+            if former_ids:
+                open_former_issues = (await db.execute(
+                    select(Issue).filter(
+                        Issue.is_deleted == False,
+                        Issue.status.notin_([IssueStatusEnum.resolved, IssueStatusEnum.closed]),
+                        or_(
+                            Issue.reported_by_id.in_(former_ids),
+                            Issue.assigned_user_id.in_(former_ids),
+                        ),
+                    )
+                )).scalars().all()
+                if open_former_issues:
+                    today_s = date.today().isoformat()
+                    src_tags = []
+                    for iss in open_former_issues:
+                        iss.status = IssueStatusEnum.resolved
+                        if not iss.actual_completion_date:
+                            iss.actual_completion_date = today_s
+                        src_tags.append(f"issue:{iss.id}")
+                    synced_tasks = (await db.execute(
+                        select(Task).filter(
+                            Task.is_deleted == False,
+                            Task.status != TaskStatusEnum.completed,
+                            Task.source.in_(src_tags),
+                        )
+                    )).scalars().all()
+                    for t in synced_tasks:
+                        t.status = TaskStatusEnum.completed
+                        t.progress = 100.0
+                        if not t.actual_completion_date:
+                            t.actual_completion_date = today_s
+                    await db.commit()
+                    print(f"Database Initialization: Auto-resolved {len(open_former_issues)} former-employee issues.")
+        except Exception as e:
+            print(f"Database Initialization: Error auto-resolving former-employee issues: {e}")
             await db.rollback()

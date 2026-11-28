@@ -76,15 +76,33 @@ async def read_tasks(
             d["has_subtasks"] = False
         data.append(d)
     
-    # Also fetch accepted issues for the Task Center
-    from app.models.issue import Issue, IssueAssignmentStatusEnum
+    # Also fetch open/in-progress accepted issues scoped appropriately
+    from app.models.issue import Issue, IssueAssignmentStatusEnum, IssueStatusEnum
+    from app.models.deleted_user import DeletedUser
+    deleted_orig_ids = select(DeletedUser.original_user_id)
+    user_role = (current_user.role.value if hasattr(current_user.role, "value") else (current_user.role or "employee")).lower()
+    is_admin = user_role in ("ceo", "admin", "super_admin") or current_user.id == 1 or getattr(current_user, "is_superuser", False)
+
     issues_stmt = (
         select(Issue)
         .options(selectinload(Issue.assigned_user), selectinload(Issue.reported_by))
-        .filter(Issue.is_deleted == False)
-        .filter(Issue.assignment_status == IssueAssignmentStatusEnum.accepted)
+        .filter(
+            Issue.is_deleted == False,
+            Issue.assignment_status == IssueAssignmentStatusEnum.accepted,
+            Issue.status.notin_([IssueStatusEnum.resolved, IssueStatusEnum.closed]),
+            ~Issue.reported_by.has((User.is_deleted == True) | (User.is_active == False)),
+            ~Issue.assigned_user.has((User.is_deleted == True) | (User.is_active == False)),
+            or_(Issue.reported_by_id == None, Issue.reported_by_id.notin_(deleted_orig_ids)),
+            or_(Issue.assigned_user_id == None, Issue.assigned_user_id.notin_(deleted_orig_ids)),
+        )
     )
-    # All accepted issues are visible in Task Center for company collaboration
+    if not is_admin:
+        issues_stmt = issues_stmt.filter(
+            or_(
+                Issue.reported_by_id == current_user.id,
+                Issue.assigned_user_id == current_user.id,
+            )
+        )
         
     issues_result = await db.execute(issues_stmt.offset(skip).limit(limit))
     issues = issues_result.scalars().all()

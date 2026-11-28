@@ -12,6 +12,7 @@ from app.models.task import Task, TaskStatusEnum
 from app.models.issue_followup import IssueFollowup
 from app.models.project import Project
 from app.models.user import User
+from app.models.deleted_user import DeletedUser
 from app.models.notification import Notification, NotificationTypeEnum
 from app.schemas.issue import IssueCreate, IssueUpdate, IssueFollowupCreate
 from app.core.responses import APIResponse, success_response, error_response
@@ -147,11 +148,14 @@ async def read_issues(
             )
         )
 
-    # Hide issues belonging to deleted / former employees by default
+    # Hide issues belonging to deleted / inactive / former employees by default
     if not include_deleted_users:
+        deleted_orig_ids = select(DeletedUser.original_user_id)
         q = q.filter(
-            ~Issue.reported_by.has(User.is_deleted == True),
-            ~Issue.assigned_user.has(User.is_deleted == True),
+            ~Issue.reported_by.has((User.is_deleted == True) | (User.is_active == False)),
+            ~Issue.assigned_user.has((User.is_deleted == True) | (User.is_active == False)),
+            or_(Issue.reported_by_id == None, Issue.reported_by_id.notin_(deleted_orig_ids)),
+            or_(Issue.assigned_user_id == None, Issue.assigned_user_id.notin_(deleted_orig_ids)),
         )
 
     if status:
@@ -186,9 +190,12 @@ async def read_issues(
             )
         )
     if not include_deleted_users:
+        deleted_orig_ids = select(DeletedUser.original_user_id)
         count_q = count_q.filter(
-            ~Issue.reported_by.has(User.is_deleted == True),
-            ~Issue.assigned_user.has(User.is_deleted == True),
+            ~Issue.reported_by.has((User.is_deleted == True) | (User.is_active == False)),
+            ~Issue.assigned_user.has((User.is_deleted == True) | (User.is_active == False)),
+            or_(Issue.reported_by_id == None, Issue.reported_by_id.notin_(deleted_orig_ids)),
+            or_(Issue.assigned_user_id == None, Issue.assigned_user_id.notin_(deleted_orig_ids)),
         )
     if status:
         count_q = count_q.filter(Issue.status == status)
