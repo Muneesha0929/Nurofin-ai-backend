@@ -107,7 +107,6 @@ async def _serialize_task(db: AsyncSession, t: Task, load_subtasks: bool = True,
                     transfer_date = info.get('transfer_date')
                     transfer_to_name = info.get('transfer_to_name')
             else:
-                from app.models.task_history import TaskHistory
                 hist_res = await db.execute(
                     select(TaskHistory)
                     .filter(TaskHistory.task_id == t.id, TaskHistory.action == "assigned", TaskHistory.is_deleted == False)
